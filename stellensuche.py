@@ -417,6 +417,40 @@ def fetch_job_detail(page, uuid: str) -> dict:
     return _page_fetch_json(page, f"{DETAIL_API}/{uuid}")
 
 
+# EG-Einstufungen (tarifliche Entgeltgruppen) erhalten als Rang direkt ihre Zahl
+# (EG12 -> 12, EG16 -> 16, ...). Die außertariflichen Führungsstufen SL1/SL2/SL3
+# liegen darüber, mit SL1 < SL2 < SL3 (Rang 101-103), unabhängig von der
+# höchsten vorkommenden EG-Zahl. Die Einstufung steht i. d. R. im Jobtitel
+# (z. B. "... (EG16, w/m/div.)" oder "..., SL1"), daher wird sowohl der Titel
+# als auch der Stellentext durchsucht.
+_EG_SL_PATTERN = re.compile(
+    r"\bEG\s*-?\s*(?P<eg>\d{1,2})\b|\bSL\s*-?\s*(?P<sl>\d)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_eg_einstufung(*texts: str) -> tuple[str | None, int | None]:
+    """Sucht in den übergebenen Texten (z. B. Jobtitel, Stellentext) nach einer
+    EG- oder SL-Einstufung.
+
+    Gibt ein Label ("EG13", "SL2") und einen numerischen Rang für Vergleiche
+    zurück (EG-Rang = EG-Zahl, SL1=101, SL2=102, SL3=103 - immer höher als
+    jede EG-Zahl). Wird nichts gefunden, wird (None, None) zurückgegeben.
+    """
+    for text in texts:
+        if not text:
+            continue
+        match = _EG_SL_PATTERN.search(text)
+        if not match:
+            continue
+        if match.group("eg"):
+            n = int(match.group("eg"))
+            return f"EG{n}", n
+        n = int(match.group("sl"))
+        return f"SL{n}", 100 + n
+    return None, None
+
+
 def build_record(detail: dict, matched_begriffe: list[str]) -> dict:
     sections = detail.get("sections", {}) or {}
     text_parts = []
@@ -425,6 +459,10 @@ def build_record(detail: dict, matched_begriffe: list[str]) -> dict:
         if section and section.get("text"):
             title = section.get("title") or key
             text_parts.append(f"{title}:\n{html_to_text(section['text'])}")
+
+    stellentext = "\n\n".join(text_parts)
+    jobtitel = detail.get("name") or ""
+    eg_einstufung, eg_rang = extract_eg_einstufung(jobtitel, stellentext)
 
     uuid = detail.get("uuid")
     return {
@@ -439,7 +477,9 @@ def build_record(detail: dict, matched_begriffe: list[str]) -> dict:
         "remote": detail.get("locationRemote"),
         "aktualisiert": detail.get("updateDate"),
         "gefundene_suchbegriffe": matched_begriffe,
-        "stellentext": "\n\n".join(text_parts),
+        "eg_einstufung": eg_einstufung,
+        "eg_rang": eg_rang,
+        "stellentext": stellentext,
         "url": f"{JOBS_URL}/{uuid}",
         "abgerufen_am": datetime.now().isoformat(timespec="seconds"),
     }
@@ -485,6 +525,10 @@ def build_html_page(records: list[dict]) -> str:
         tags = "".join(f'<span class="tag">{html.escape(b)}</span>' for b in begriffe)
         stellentext_raw = rec.get("stellentext") or ""
         stellentext = html.escape(stellentext_raw).replace("\n", "<br>")
+        eg_label = rec.get("eg_einstufung")
+        eg_rang = rec.get("eg_rang")
+        eg_rang_attr = str(eg_rang) if eg_rang is not None else ""
+        eg_tag = f'<span class="tag eg-tag">{html.escape(eg_label)}</span>' if eg_label else ""
 
         job_id = html.escape((rec.get("url") or f"job-{idx}").rsplit("/", 1)[-1] or f"job-{idx}")
         jobs_data[job_id] = {
@@ -496,7 +540,7 @@ def build_html_page(records: list[dict]) -> str:
         meta_line = ", ".join(meta_parts)
 
         cards.append(f"""
-        <article class="card" id="card_{job_id}">
+        <article class="card" id="card_{job_id}" data-eg-rang="{eg_rang_attr}">
             <h2><a href="{url}" target="_blank" rel="noopener">{title}</a></h2>
             <div class="meta">
                 {f'<span>📍 {meta_line}</span>' if meta_line else ''}
@@ -504,7 +548,7 @@ def build_html_page(records: list[dict]) -> str:
                 {f'<span>💼 {anstellungsart}</span>' if anstellungsart else ''}
                 {f'<span>🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
             </div>
-            <div class="tags">{tags}</div>
+            <div class="tags">{eg_tag}{tags}</div>
             <div class="actions">
                 <label class="beworben-label">
                     <input type="checkbox" class="beworben-checkbox" data-id="{job_id}">
@@ -520,6 +564,10 @@ def build_html_page(records: list[dict]) -> str:
 
     cards_html = "\n".join(cards) if cards else '<p class="empty">Keine passenden Stellen gefunden.</p>'
     jobs_data_json = json.dumps(jobs_data, ensure_ascii=False).replace("</", "<\\/")
+
+    eg_level_options = "".join(f'<option value="{n}">EG{n}</option>' for n in range(1, 19))
+    eg_level_options += "".join(f'<option value="{100 + n}">SL{n}</option>' for n in range(1, 4))
+
 
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -603,6 +651,32 @@ def build_html_page(records: list[dict]) -> str:
         color: #333;
     }}
     .empty {{ color: #777; }}
+    .eg-tag {{ background: #fdecea; color: #a13a2a; }}
+    .filterbar {{
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        background: #fff;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 16px;
+        font-size: 0.9rem;
+    }}
+    .filterbar label {{ display: flex; align-items: center; gap: 6px; }}
+    .filterbar select {{ padding: 4px 6px; }}
+    .filterbar .reset-btn {{
+        background: none;
+        border: 1px solid #005691;
+        color: #005691;
+        border-radius: 6px;
+        padding: 4px 10px;
+        cursor: pointer;
+        font-size: 0.85rem;
+    }}
+    .filterbar .reset-btn:hover {{ background: #e8f1f8; }}
+    .filter-count {{ color: #555; }}
 </style>
 </head>
 <body>
@@ -610,6 +684,25 @@ def build_html_page(records: list[dict]) -> str:
     <h1>Bosch Stellensuche – Ergebnisse</h1>
     <p>{len(records)} passende Stelle(n) &middot; erzeugt am {generated_at}</p>
 </header>
+<div class="filterbar">
+    <label>EG/SL-Einstufung
+        <select id="eg-operator">
+            <option value="=">=</option>
+            <option value="<">&lt;</option>
+            <option value="<=">&le;</option>
+            <option value=">">&gt;</option>
+            <option value=">=">&ge;</option>
+        </select>
+    </label>
+    <label>
+        <select id="eg-level">
+            <option value="">Alle Stufen</option>
+            {eg_level_options}
+        </select>
+    </label>
+    <button type="button" class="reset-btn" id="eg-reset">Filter zurücksetzen</button>
+    <span class="filter-count" id="eg-filter-count"></span>
+</div>
 <main>
 {cards_html}
 </main>
@@ -650,6 +743,53 @@ document.addEventListener("DOMContentLoaded", () => {{
 
     document.querySelectorAll(".download-btn").forEach((btn) => {{
         btn.addEventListener("click", () => downloadTxt(btn.dataset.id));
+    }});
+
+    const opSelect = document.getElementById("eg-operator");
+    const levelSelect = document.getElementById("eg-level");
+    const resetBtn = document.getElementById("eg-reset");
+    const countLabel = document.getElementById("eg-filter-count");
+    const allCards = Array.from(document.querySelectorAll(".card"));
+
+    function compare(rang, op, target) {{
+        switch (op) {{
+            case "=": return rang === target;
+            case "<": return rang < target;
+            case "<=": return rang <= target;
+            case ">": return rang > target;
+            case ">=": return rang >= target;
+            default: return true;
+        }}
+    }}
+
+    function applyEgFilter() {{
+        const target = levelSelect.value;
+        const op = opSelect.value;
+        let visible = 0;
+        allCards.forEach((card) => {{
+            let show = true;
+            if (target !== "") {{
+                const rawRang = card.dataset.egRang;
+                if (rawRang === "") {{
+                    show = false;
+                }} else {{
+                    show = compare(parseInt(rawRang, 10), op, parseInt(target, 10));
+                }}
+            }}
+            card.style.display = show ? "" : "none";
+            if (show) visible++;
+        }});
+        countLabel.textContent = target === ""
+            ? ""
+            : `${{visible}} von ${{allCards.length}} Stellen passen zum Filter`;
+    }}
+
+    opSelect.addEventListener("change", applyEgFilter);
+    levelSelect.addEventListener("change", applyEgFilter);
+    resetBtn.addEventListener("click", () => {{
+        levelSelect.value = "";
+        opSelect.value = "=";
+        applyEgFilter();
     }});
 }});
 </script>

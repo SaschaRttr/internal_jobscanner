@@ -1,0 +1,32 @@
+Stellensuche starten ohne Admin-Rechte / PATH-Änderung
+========================================================
+
+Hintergrund:
+Der Befehl "python" zeigt auf deinem Rechner auf den Windows-Store-Alias-Stub
+(...\AppData\Local\Microsoft\WindowsApps\python.exe), nicht auf die echte
+Python-Installation. Da du keine Admin-Rechte hast, um das über die
+Systemeinstellungen (App execution aliases / PATH) zu ändern, nutze
+stattdessen einfach den vollen Pfad zur echten Python-Installation.
+
+Befehl zum Starten (PowerShell), im Ordner Stellensuche_intern ausführen:
+
+& "C:\Program Files\Miniforge\python.exe" stellensuche.py
+
+Mit Zusatzoptionen, z. B. nur die 20 neuesten Stellen prüfen:
+
+& "C:\Program Files\Miniforge\python.exe" stellensuche.py --max-jobs 20
+
+Browserfenster unsichtbar starten (nur sinnvoll mit bestehender Session):
+
+& "C:\Program Files\Miniforge\python.exe" stellensuche.py --headless
+
+Ablauf:
+1. Befehl oben in PowerShell im Projektordner ausführen.
+2. Es öffnet sich ein Chromium-Fenster (oder die Session ist noch gültig).
+3. Falls Login nötig: im Browserfenster per SSO einloggen.
+4. Danach im Terminal einmal Enter drücken, damit die Suche startet.
+5. Ergebnisse landen in bosch_jobs_gefiltert.json und bosch_jobs_gefiltert.html.
+
+Tipp: Man kann sich diesen Befehl auch als kleine .ps1-Datei ablegen, z. B.
+"start_suche.ps1" mit obigem Inhalt, und dann per Rechtsklick "Mit PowerShell
+ausführen" starten, ohne den Befehl jedes Mal neu abzutippen.
