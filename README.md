@@ -6,15 +6,19 @@ Wunschorten passen.
 
 ## Was du brauchst
 
-- Die Datei `Stellensuche.exe`
-- Die Datei `config.txt`
-- Beide Dateien müssen **im selben Ordner** liegen (z. B. `C:\Stellensuche\`)
+- Den kompletten Ordner `Stellensuche` (enthält `Stellensuche.exe` sowie mehrere
+  DLL- und Datendateien – **alle Dateien im Ordner werden benötigt**, nicht
+  nur die `.exe`)
+- Die Datei `config.txt` **im selben Ordner** wie `Stellensuche.exe`
 
 Keine Python-Installation, keine Terminal-Kenntnisse nötig.
 
+> Der Ordner darf nicht auseinandergenommen werden – die `.exe` funktioniert
+> nur zusammen mit den restlichen Dateien im selben Verzeichnis.
+
 ## Erster Start
 
-1. Doppelklick auf `Stellensuche.exe`.
+1. Doppelklick auf `Stellensuche.exe` (im Ordner `Stellensuche`).
 2. Beim allerersten Start wird einmalig automatisch der Chromium-Browser
    heruntergeladen ("Chromium-Browser wird für Playwright installiert...").
    Das kann etwas dauern – bitte warten, bis "Chromium-Installation
@@ -93,3 +97,18 @@ dort liegt die Session.
 **Fehlermeldung "Konfigurationsdatei nicht gefunden"?**
 `config.txt` fehlt im selben Ordner wie `Stellensuche.exe` – Datei dorthin
 kopieren.
+
+**Fehlermeldung `[PYI-...:ERROR] Failed to load Python DLL ... LoadLibrary: This
+program is blocked by group policy`?**
+Das passiert, wenn die `.exe` nicht als kompletter Ordner weitergegeben wurde,
+sondern als einzelne Datei aus einem Zip/Download-Ordner gestartet wird, oder
+wenn eine ältere `--onefile`-Version im Umlauf ist. Diese alte Variante
+entpackt sich bei jedem Start selbst in den Temp-Ordner
+(`%TEMP%\_MEIxxxxx`) – und genau das blockieren viele Firmen-Gruppenrichtlinien
+(Software Restriction Policy/AppLocker), da Programme dort nicht ausgeführt
+werden dürfen. Abhilfe: die neue Version verwenden, bei der `Stellensuche.exe`
+zusammen mit allen DLL-Dateien in einem eigenen Ordner liegt (kein
+Selbst-Entpacken in Temp mehr nötig). Den kompletten Ordner an einen Ort
+kopieren, auf den man Schreib-/Ausführungsrechte hat (z. B. `C:\Stellensuche\`
+oder den eigenen Benutzerordner), nicht direkt aus dem Download- oder
+Zip-Ordner heraus starten.
