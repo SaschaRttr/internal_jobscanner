@@ -46,6 +46,8 @@ import os
 import re
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +76,8 @@ else:
 
 CONFIG_FILE = SCRIPT_DIR / "config.txt"
 PROFILE_DIR = SCRIPT_DIR / ".browser_profile"
+GEOCODE_CACHE_FILE = SCRIPT_DIR / "geocode_cache.json"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 PORTAL_BASE = "https://www.smartrecruiters.com"
 JOBS_URL = f"{PORTAL_BASE}/app/employee-portal/58652035e4b04016904de9fe/jobs"
@@ -266,6 +270,79 @@ def location_matches(detail: dict, cities: list[str]) -> bool:
     region = (detail.get("regionName") or "").strip().lower()
 
     return any(c.lower() in location or c.lower() in region for c in cities)
+
+
+def load_geocode_cache() -> dict:
+    """Lädt den lokalen Geocoding-Cache (geocode_cache.json), falls vorhanden.
+
+    Der Cache bildet Adressen (lowercased) auf [lat, lon] oder null (nicht
+    gefunden) ab, damit dieselbe Adresse nicht bei jedem Lauf erneut bei
+    Nominatim angefragt werden muss.
+    """
+    if not GEOCODE_CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(GEOCODE_CACHE_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_geocode_cache(cache: dict) -> None:
+    GEOCODE_CACHE_FILE.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def geocode_address(address: str, cache: dict, proxy_server: str | None = None) -> tuple[float, float] | None:
+    """Ermittelt Breiten-/Längengrad für eine Adresse via OpenStreetMap Nominatim.
+
+    Ergebnisse werden im übergebenen Cache-Dict gespeichert (Aufrufer ist für
+    das Speichern via save_geocode_cache verantwortlich). Laut Nominatim-
+    Nutzungsrichtlinie ist maximal eine Anfrage pro Sekunde erlaubt, daher wird
+    nach jeder tatsächlichen Netzwerkanfrage kurz gewartet. Ist proxy_server
+    gesetzt (z. B. im Firmennetz erforderlich), wird er für die Anfrage genutzt.
+    """
+    if not address:
+        return None
+    key = address.strip().lower()
+    if key in cache:
+        value = cache[key]
+        return (value[0], value[1]) if value else None
+
+    query = urllib.parse.urlencode({"format": "json", "q": address, "limit": 1})
+    request = urllib.request.Request(
+        f"{NOMINATIM_URL}?{query}",
+        headers={"User-Agent": "Stellensuche-intern/1.0 (internes Tool)"},
+    )
+    try:
+        if proxy_server:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_server, "https": proxy_server})
+            )
+            resp = opener.open(request, timeout=10)
+        else:
+            resp = urllib.request.urlopen(request, timeout=10)
+        with resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        cache[key] = None
+        return None
+    finally:
+        time.sleep(1)
+
+    if not data:
+        cache[key] = None
+        return None
+
+    try:
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+    except (KeyError, ValueError, TypeError):
+        cache[key] = None
+        return None
+
+    cache[key] = [lat, lon]
+    return lat, lon
 
 
 def html_to_text(fragment: str) -> str:
@@ -500,7 +577,7 @@ def _format_date(value) -> str:
     return str(value)
 
 
-def build_html_page(records: list[dict]) -> str:
+def build_html_page(records: list[dict], map_filename: str | None = None) -> str:
     """Erzeugt eine übersichtliche, eigenständige HTML-Seite aus den Job-Records.
 
     Enthält eine "Beworben"-Checkbox pro Stelle (Status wird im Browser via
@@ -682,7 +759,7 @@ def build_html_page(records: list[dict]) -> str:
 <body>
 <header>
     <h1>Bosch Stellensuche – Ergebnisse</h1>
-    <p>{len(records)} passende Stelle(n) &middot; erzeugt am {generated_at}</p>
+    <p>{len(records)} passende Stelle(n) &middot; erzeugt am {generated_at}{f' &middot; <a href="{html.escape(map_filename)}">🗺️ Karte anzeigen</a>' if map_filename else ''}</p>
 </header>
 <div class="filterbar">
     <label>EG/SL-Einstufung
@@ -692,11 +769,18 @@ def build_html_page(records: list[dict]) -> str:
             <option value="<=">&le;</option>
             <option value=">">&gt;</option>
             <option value=">=">&ge;</option>
+            <option value="between">zwischen</option>
         </select>
     </label>
     <label>
         <select id="eg-level">
             <option value="">Alle Stufen</option>
+            {eg_level_options}
+        </select>
+    </label>
+    <label id="eg-level-2-label" style="display:none;">und
+        <select id="eg-level-2">
+            <option value="">...</option>
             {eg_level_options}
         </select>
     </label>
@@ -747,31 +831,44 @@ document.addEventListener("DOMContentLoaded", () => {{
 
     const opSelect = document.getElementById("eg-operator");
     const levelSelect = document.getElementById("eg-level");
+    const level2Select = document.getElementById("eg-level-2");
+    const level2Label = document.getElementById("eg-level-2-label");
     const resetBtn = document.getElementById("eg-reset");
     const countLabel = document.getElementById("eg-filter-count");
     const allCards = Array.from(document.querySelectorAll(".card"));
 
-    function compare(rang, op, target) {{
+    function compare(rang, op, target, target2) {{
         switch (op) {{
             case "=": return rang === target;
             case "<": return rang < target;
             case "<=": return rang <= target;
             case ">": return rang > target;
             case ">=": return rang >= target;
+            case "between": {{
+                const lo = Math.min(target, target2);
+                const hi = Math.max(target, target2);
+                return rang >= lo && rang <= hi;
+            }}
             default: return true;
         }}
     }}
 
     function applyEgFilter() {{
-        const target = levelSelect.value;
         const op = opSelect.value;
+        const target = levelSelect.value;
+        const target2 = level2Select.value;
+        level2Label.style.display = op === "between" ? "" : "none";
+
+        const filterActive = op === "between" ? (target !== "" && target2 !== "") : target !== "";
         let visible = 0;
         allCards.forEach((card) => {{
             let show = true;
-            if (target !== "") {{
+            if (filterActive) {{
                 const rawRang = card.dataset.egRang;
                 if (rawRang === "") {{
                     show = false;
+                }} else if (op === "between") {{
+                    show = compare(parseInt(rawRang, 10), op, parseInt(target, 10), parseInt(target2, 10));
                 }} else {{
                     show = compare(parseInt(rawRang, 10), op, parseInt(target, 10));
                 }}
@@ -779,19 +876,121 @@ document.addEventListener("DOMContentLoaded", () => {{
             card.style.display = show ? "" : "none";
             if (show) visible++;
         }});
-        countLabel.textContent = target === ""
-            ? ""
-            : `${{visible}} von ${{allCards.length}} Stellen passen zum Filter`;
+        countLabel.textContent = filterActive
+            ? `${{visible}} von ${{allCards.length}} Stellen passen zum Filter`
+            : "";
     }}
 
     opSelect.addEventListener("change", applyEgFilter);
     levelSelect.addEventListener("change", applyEgFilter);
+    level2Select.addEventListener("change", applyEgFilter);
     resetBtn.addEventListener("click", () => {{
         levelSelect.value = "";
+        level2Select.value = "";
         opSelect.value = "=";
         applyEgFilter();
     }});
 }});
+</script>
+</body>
+</html>
+"""
+
+
+def build_map_page(records: list[dict], geocode_cache: dict, proxy_server: str | None = None) -> str:
+    """Erzeugt eine eigenständige HTML-Seite mit einer Karte (Leaflet/OSM),
+    auf der jede Stelle als Punkt an ihrem Standort eingeblendet wird.
+
+    Adressen werden über den übergebenen Geocoding-Cache aufgelöst (siehe
+    geocode_address). Mehrere Stellen am selben Ort werden zu einem
+    gemeinsamen Marker zusammengefasst.
+    """
+    generated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    points: dict[str, dict] = {}
+    missing = 0
+    for rec in records:
+        ort = (rec.get("ort") or "").strip()
+        if not ort:
+            missing += 1
+            continue
+        coords = geocode_address(ort, geocode_cache, proxy_server=proxy_server)
+        if not coords:
+            missing += 1
+            continue
+        lat, lon = coords
+        key = f"{lat:.5f},{lon:.5f}"
+        entry = points.setdefault(key, {"lat": lat, "lon": lon, "ort": ort, "jobs": []})
+        entry["jobs"].append({
+            "title": rec.get("jobtitel") or "",
+            "url": rec.get("url") or "#",
+        })
+
+    markers = list(points.values())
+    markers_json = json.dumps(markers, ensure_ascii=False).replace("</", "<\\/")
+
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bosch Stellensuche \u2013 Karte</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+    :root {{ color-scheme: light dark; }}
+    body {{
+        font-family: "Segoe UI", Arial, sans-serif;
+        margin: 0;
+        padding: 0;
+        color: #1a1a1a;
+    }}
+    header {{
+        padding: 16px 24px;
+        background: #fff;
+        border-bottom: 1px solid #e0e0e0;
+    }}
+    header h1 {{ margin: 0 0 4px 0; font-size: 1.3rem; }}
+    header p {{ color: #555; margin: 0; font-size: 0.9rem; }}
+    header a {{ color: #005691; text-decoration: none; }}
+    header a:hover {{ text-decoration: underline; }}
+    #map {{ height: calc(100vh - 78px); width: 100%; }}
+    .popup-jobs {{ margin: 6px 0 0 0; padding-left: 18px; }}
+    .popup-jobs li {{ margin-bottom: 4px; }}
+</style>
+</head>
+<body>
+<header>
+    <h1>Bosch Stellensuche \u2013 Karte</h1>
+    <p>{len(markers)} Standort(e) &middot; {len(records)} passende Stelle(n)
+        {f' &middot; {missing} ohne ermittelbaren Standort' if missing else ''}
+        &middot; erzeugt am {generated_at} &middot; <a href="javascript:history.back()">\u2190 Zur\u00fcck zur Liste</a></p>
+</header>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const MARKERS = {markers_json};
+
+const map = L.map('map').setView([51.1657, 10.4515], 6);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'
+}}).addTo(map);
+
+const bounds = [];
+MARKERS.forEach((pt) => {{
+    bounds.push([pt.lat, pt.lon]);
+    const jobsHtml = pt.jobs.map((j) => {{
+        const safeTitle = j.title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return `<li><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a></li>`;
+    }}).join("");
+    const safeOrt = pt.ort.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const popupHtml = `<strong>${{safeOrt}}</strong><ul class="popup-jobs">${{jobsHtml}}</ul>`;
+    L.marker([pt.lat, pt.lon]).addTo(map).bindPopup(popupHtml);
+}});
+
+if (bounds.length) {{
+    map.fitBounds(bounds, {{ padding: [30, 30] }});
+}}
 </script>
 </body>
 </html>
@@ -806,6 +1005,10 @@ def main() -> None:
                          help="Ausgabedatei (Default: bosch_jobs_gefiltert.json)")
     parser.add_argument("--html-output", type=str, default=None,
                          help="HTML-Ausgabedatei (Default: gleicher Name wie --output mit .html-Endung)")
+    parser.add_argument("--map-output", type=str, default=None,
+                         help="HTML-Kartenansicht (Default: gleicher Name wie --output mit _karte.html-Endung)")
+    parser.add_argument("--no-map", action="store_true",
+                         help="Keine Kartenansicht erzeugen (spart Geocoding-Anfragen)")
     parser.add_argument("--headless", action="store_true",
                          help="Browser unsichtbar starten (nur mit bestehender Session sinnvoll)")
     args = parser.parse_args()
@@ -867,7 +1070,24 @@ def main() -> None:
     html_output_path = (
         SCRIPT_DIR / args.html_output if args.html_output else output_path.with_suffix(".html")
     )
-    html_output_path.write_text(build_html_page(records), encoding="utf-8")
+    map_output_path = (
+        SCRIPT_DIR / args.map_output if args.map_output
+        else output_path.parent / f"{output_path.stem}_karte.html"
+    )
+
+    map_filename = None
+    if not args.no_map:
+        print("\nErmittle Standorte für die Kartenansicht (Geocoding via OpenStreetMap)...")
+        geocode_cache = load_geocode_cache()
+        try:
+            map_html = build_map_page(records, geocode_cache, proxy_server=proxy_server)
+        finally:
+            save_geocode_cache(geocode_cache)
+        map_output_path.write_text(map_html, encoding="utf-8")
+        print(f"Kartenansicht gespeichert in: {map_output_path}")
+        map_filename = map_output_path.name
+
+    html_output_path.write_text(build_html_page(records, map_filename=map_filename), encoding="utf-8")
     print(f"HTML-Übersicht gespeichert in: {html_output_path}")
 
 

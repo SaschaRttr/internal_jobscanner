@@ -1,6 +1,8 @@
 .browser_profile/
 bosch_jobs_gefiltert.json
 bosch_jobs_gefiltert.html
+bosch_jobs_gefiltert_karte.html
+geocode_cache.json
 __pycache__/
 *.pyc
 build/
