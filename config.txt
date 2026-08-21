@@ -175,6 +175,8 @@ Seriendisponent
 Lead
 Key Account Manager
 Software engineer
+Software Entwickler
+Softwareentwickler
 planner
 FPGA
 Pilote synthèse
@@ -193,6 +195,10 @@ Auszubildenden
 Bachelorand
 Masterand
 wartung
+feuerwehr
+Werkfeuerwehr
+Zugführer
+Brandschutz
 aussendienst
 außendienst
 key+account
@@ -204,6 +210,11 @@ Director
 Business+development 
 Redakteur
 Produktionsmitarbeiter
+Promotion
+SW-Entwickler
+PhD
+Gruppenleitung
+Linux
 [\ausschlussbegriffe]
 
 [orte]

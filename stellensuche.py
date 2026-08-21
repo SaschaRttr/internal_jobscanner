@@ -7,20 +7,28 @@ nach den neuesten Stellenausschreibungen, filtert sie anhand der Suchbegriffe
 aus config.txt und speichert die passenden Treffer (inkl. vollständigem
 Stellentext und Link) als JSON-Datei.
 
-Einmalige Einrichtung
-----------------------
-    pip install -r requirements.txt
-    playwright install chromium
+Zwei Nutzungsarten
+------------------
+1) Als Python-Skript (Entwicklung):
+       pip install -r requirements.txt
+       playwright install chromium
+       python stellensuche.py
 
-Ausführen
----------
-    python stellensuche.py
+2) Als eigenständige Stellensuche.exe (für Kollegen ohne Python):
+       Stellensuche.exe muss zusammen mit config.txt im selben Ordner liegen.
+       Einfach per Doppelklick starten. Chromium wird beim allerersten Start
+       automatisch heruntergeladen (einmalig, Internet/Proxy nötig) und
+       dauerhaft in "%LOCALAPPDATA%\\ms-playwright" abgelegt, sodass künftige
+       Starts das nicht wiederholen müssen.
+       Siehe build_exe.ps1, um die .exe selbst neu zu bauen (PyInstaller).
 
 Beim ersten Start öffnet sich ein Chromium-Fenster. Bitte dort manuell im
 Bosch-Portal einloggen (SSO). Danach im Terminal Enter drücken, um
 fortzufahren. Die Login-Session wird in einem lokalen Browser-Profil-Ordner
 (".browser_profile") gespeichert, sodass bei künftigen Läufen in der Regel
-kein erneuter Login nötig ist (bis die Session abläuft).
+kein erneuter Login nötig ist (bis die Session abläuft). Bei der .exe bleibt
+das Konsolenfenster nach dem Lauf offen (auch bei Fehlern), bis Enter
+gedrückt wird.
 
 Optionen
 --------
@@ -42,9 +50,28 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+# Als gebündelte .exe (PyInstaller) extrahiert Playwright seinen Treiber in
+# einen temporären "_MEI..."-Ordner, der nach jedem Lauf gelöscht wird. Ohne
+# explizite PLAYWRIGHT_BROWSERS_PATH würde Chromium dort hinein installiert
+# und wäre beim nächsten Start wieder weg. Deshalb VOR dem Playwright-Import
+# einen dauerhaften, nutzerspezifischen Ordner festlegen.
+if getattr(sys, "frozen", False):
+    # Der PyInstaller-Runtime-Hook von Playwright setzt PLAYWRIGHT_BROWSERS_PATH
+    # bereits VOR dem Start dieses Skripts auf "0" (lokal, relativ zum
+    # temporären _MEI-Ordner). Das muss hier hart überschrieben werden.
+    _browsers_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ms-playwright"
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_browsers_dir)
+
 from playwright.sync_api import sync_playwright
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# Läuft das Skript als gebündelte .exe (PyInstaller), liegen config.txt,
+# Browser-Profil und Ausgabedateien neben der .exe. Im normalen Python-Betrieb
+# liegen sie neben stellensuche.py.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+
 CONFIG_FILE = SCRIPT_DIR / "config.txt"
 PROFILE_DIR = SCRIPT_DIR / ".browser_profile"
 
@@ -65,6 +92,35 @@ PAGE_SIZE = 100
 # Fallback-Proxy für das Bosch-Firmennetz (falls nicht per Env-Variable/PAC ermittelbar)
 FALLBACK_PROXY = "http://rb-proxy-de.bosch.com:8080"
 PAC_URL = "http://rbins.bosch.com/fe.pac"
+
+
+def ensure_chromium_installed() -> None:
+    """Installiert den Chromium-Browser für Playwright, falls noch nicht vorhanden.
+
+    Wichtig für Kollegen, die nur die gebündelte .exe erhalten haben und nie
+    manuell "playwright install chromium" ausgeführt haben. Der Download läuft
+    beim allerersten Start automatisch (Internet/Proxy nötig).
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return
+    except Exception:
+        pass
+
+    print("Chromium-Browser wird für Playwright installiert (einmalig, bitte warten)...")
+    from playwright.__main__ import main as playwright_cli_main
+
+    old_argv = sys.argv
+    sys.argv = ["playwright", "install", "chromium"]
+    try:
+        playwright_cli_main()
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = old_argv
+    print("Chromium-Installation abgeschlossen.")
 
 
 def detect_proxy() -> str | None:
@@ -302,6 +358,12 @@ def _page_fetch_json(page, url: str, method: str = "GET", body: dict | None = No
 
 def fetch_job_list(page, max_jobs: int | None = None) -> list[dict]:
     """Holt Stellen über die Such-API (Pagination), neueste zuerst.
+
+    HINWEIS: Ein Versuch, die Suchbegriffe serverseitig als OR-Query an die
+    API zu übergeben, wurde getestet, führte aber mit dem vollen
+    Begriffs-Set (103 Begriffe) zu einem 500-Fehler der API. Deshalb wird
+    weiterhin mit leerer Query geladen und ausschließlich lokal gefiltert
+    (`filter_matching_jobs`).
 
     Wenn `max_jobs` None ist, werden ALLE verfügbaren Stellen geholt.
     """
@@ -619,6 +681,8 @@ def main() -> None:
     cities = load_locations(CONFIG_FILE)
     print(f"{len(cities)} Orts-Filter aus config.txt geladen.")
 
+    ensure_chromium_installed()
+
     proxy_server = detect_proxy()
     launch_kwargs = {"user_data_dir": str(PROFILE_DIR), "headless": args.headless}
     if proxy_server:
@@ -671,4 +735,11 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        sys.exit("\nAbgebrochen.")
+        print("\nAbgebrochen.")
+    except Exception as exc:  # pragma: no cover - Absicherung für die .exe
+        print(f"\nFehler: {exc}")
+    finally:
+        # Läuft das Skript als gebündelte .exe (Doppelklick), würde sich das
+        # Konsolenfenster sonst sofort schließen. So kann man die Ausgabe lesen.
+        if getattr(sys, "frozen", False):
+            input("\nFertig. Enter drücken, um das Fenster zu schließen...")
