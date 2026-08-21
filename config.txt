@@ -1,0 +1,223 @@
+[suchbegriffe]
+Characterization
+PIC
+Poc
+prototyp
+hardware
+test
+validierung
+messtechnik
+prüfingenieur
+prüftechnik
+testingenieur
+embedded
+elektronik
+entwicklung
+inbetriebnahme
+datenanalyse
+python
+test engineer
+testingenieur
+testentwickl
+prüftechniker
+prüafingenieur
+validation
+validierung
+verification
+verifizierung
+V&V
+IVVQ
+versuchsingenieur
+qualifizierung
+testautomatisierung
+test automation
+inbetriebnahme
+troubleshoot
+fehleranalyse
+fehlerinjektion
+2nd level
+3rd level
+feldtest
+field test
+systemtest
+modultest
+ASIC
+ISO 26262
+hardware engineer
+hardwareentwickl
+schaltplan
+layout engineer
+PCB
+leiterplatte
+altium
+prototyp
+elektronikentwickl
+electronics engineer
+electronics development
+messtechnik
+measurement
+signalaufbereitung
+sensorik
+sensor
+EMV
+leistungselektronik
+power electronics
+inverter
+steuergerät
+embedded
+analog
+mixed signal
+datenanalys
+data engineer
+data analyst
+dashboard
+databricks
+visualisierung
+python
+SQL
+plotly
+pandas
+datenerfassung
+data acquisition
+ladeinfrastruktur
+batteriespeicher
+elektrotechniker
+elektroingenieur
+batterie
+Prüfgeräte
+Prüfsoftwar
+reproduzierbar
+Testsystem
+development engineer
+product engineer
+Entwicklungsingenieur
+Systemingenieur
+field
+Test Engineer
+Validation Engineer
+Hardware Test Engineer
+System Test Engineer
+Electronics Test Engineer
+Embedded Test Engineer
+Test & Measurement Engineer
+R&D Test Engineer
+HIL Test Engineer
+Test Automation Engineer
+Versuchsingenieur
+Prüfingenieur
+Pruefingenieur
+Testingenieur
+Entwicklungstechniker Test & Validierung
+Hardwareentwickler Testsysteme
+Mess- und Prüftechniker
+Electrical
+Laboringenieur
+Versuchstechniker
+[\suchbegriffe]
+
+[ausschlussbegriffe]
+PreMaster
+duales studium
+praxissemester
+auszubildender
+thesis
+technikerarbeit
+leiter
+bach
+Werkstudent
+außendienst
+Baustellenleiter
+Pflichtpraktikant
+vertrieb
+verkauf
+fahrer
+reinigung
+pflege
+koch
+management
+manager
+teamleiter
+abteilungsleiter
+bereichsleiter
+gruppenleiter
+projektleiter
+netzwerk
+network
+systemadministrator
+Helpdesk
+Praktikant
+Abschlussarbeit
+praktikum
+working student
+internship
+intern
+trainee
+duales studium
+schüler
+abschlussarbeit
+masterarbeit
+bachelorarbeit
+reisetätigkeit
+reisebereit
+dienstreise
+vor ort beim kunden
+kundenstandort
+Hilfskraft
+Chemielaborant
+Mathematiker
+Statistiker
+PLM
+Quality
+Librarian
+Crypto
+Ausbildung
+Seriendisponent
+Lead
+Key Account Manager
+Software engineer
+planner
+FPGA
+Pilote synthèse
+Thermohydraul
+Projekt
+Mechanical
+Einkäufer
+Sales
+Servicetechniker
+Process
+Mechanics
+Safety
+Projektcontrolling
+Controlling
+Auszubildenden
+Bachelorand
+Masterand
+wartung
+aussendienst
+außendienst
+key+account
+Ausbildung
+cookie
+Onboarding
+Initiativbewerbung
+Director
+Business+development 
+Redakteur
+Produktionsmitarbeiter
+[\ausschlussbegriffe]
+
+[orte]
+#Germany
+Stuttgart
+Kusterdingen
+Schwieberdingen
+Leinfelden-Echterdingen
+Leonberg
+Renningen
+Wernau
+Gerlingen
+Plochingen
+Ditzingen
+Reutlingen
+[\orte]
+

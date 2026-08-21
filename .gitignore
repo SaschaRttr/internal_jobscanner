@@ -1,0 +1,8 @@
+.browser_profile/
+bosch_jobs_gefiltert.json
+bosch_jobs_gefiltert.html
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
