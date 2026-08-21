@@ -23,6 +23,7 @@ $python = "C:\Program Files\Miniforge\python.exe"
     --name Stellensuche `
     --collect-all playwright `
     --clean `
+    --noconfirm `
     stellensuche.py
 
 Write-Host ""
