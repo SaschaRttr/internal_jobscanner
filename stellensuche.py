@@ -359,6 +359,12 @@ def _page_fetch_json(page, url: str, method: str = "GET", body: dict | None = No
 def fetch_job_list(page, max_jobs: int | None = None) -> list[dict]:
     """Holt Stellen über die Such-API (Pagination), neueste zuerst.
 
+    HINWEIS: Ein Versuch, die Suchbegriffe serverseitig als OR-Query an die
+    API zu übergeben, wurde getestet, führte aber mit dem vollen
+    Begriffs-Set (103 Begriffe) zu einem 500-Fehler der API. Deshalb wird
+    weiterhin mit leerer Query geladen und ausschließlich lokal gefiltert
+    (`filter_matching_jobs`).
+
     Wenn `max_jobs` None ist, werden ALLE verfügbaren Stellen geholt.
     """
     jobs: list[dict] = []
