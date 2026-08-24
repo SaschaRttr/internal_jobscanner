@@ -7,6 +7,14 @@ nach den neuesten Stellenausschreibungen, filtert sie anhand der Suchbegriffe
 aus config.txt und speichert die passenden Treffer (inkl. vollständigem
 Stellentext und Link) als JSON-Datei.
 
+Dieses Skript ist der reine "Scraper"-Teil (braucht Playwright + einen SSO-
+Login im Bosch-Portal und lässt sich daher nicht ohne echten Zugang testen).
+Die JSON-Datei wird anschließend an stellen_verarbeitung.py übergeben, das
+daraus die HTML-Listen- und Kartenansicht erzeugt (inkl. Status-Dropdown
+"Kein Status / Möchte mich bewerben / Beworben"). Wer nur an der Anzeige
+arbeitet, kann stellen_verarbeitung.py direkt gegen eine vorhandene JSON-Datei
+testen, ohne diese Datei hier auszuführen.
+
 Zwei Nutzungsarten
 ------------------
 1) Als Python-Skript (Entwicklung):
@@ -52,6 +60,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import stellen_verarbeitung
+
 # Als gebündelte .exe (PyInstaller) extrahiert Playwright seinen Treiber in
 # einen temporären "_MEI..."-Ordner, der nach jedem Lauf gelöscht wird. Ohne
 # explizite PLAYWRIGHT_BROWSERS_PATH würde Chromium dort hinein installiert
@@ -76,8 +86,6 @@ else:
 
 CONFIG_FILE = SCRIPT_DIR / "config.txt"
 PROFILE_DIR = SCRIPT_DIR / ".browser_profile"
-GEOCODE_CACHE_FILE = SCRIPT_DIR / "geocode_cache.json"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 PORTAL_BASE = "https://www.smartrecruiters.com"
 JOBS_URL = f"{PORTAL_BASE}/app/employee-portal/58652035e4b04016904de9fe/jobs"
@@ -272,79 +280,6 @@ def location_matches(detail: dict, cities: list[str]) -> bool:
     return any(c.lower() in location or c.lower() in region for c in cities)
 
 
-def load_geocode_cache() -> dict:
-    """Lädt den lokalen Geocoding-Cache (geocode_cache.json), falls vorhanden.
-
-    Der Cache bildet Adressen (lowercased) auf [lat, lon] oder null (nicht
-    gefunden) ab, damit dieselbe Adresse nicht bei jedem Lauf erneut bei
-    Nominatim angefragt werden muss.
-    """
-    if not GEOCODE_CACHE_FILE.exists():
-        return {}
-    try:
-        return json.loads(GEOCODE_CACHE_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def save_geocode_cache(cache: dict) -> None:
-    GEOCODE_CACHE_FILE.write_text(
-        json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def geocode_address(address: str, cache: dict, proxy_server: str | None = None) -> tuple[float, float] | None:
-    """Ermittelt Breiten-/Längengrad für eine Adresse via OpenStreetMap Nominatim.
-
-    Ergebnisse werden im übergebenen Cache-Dict gespeichert (Aufrufer ist für
-    das Speichern via save_geocode_cache verantwortlich). Laut Nominatim-
-    Nutzungsrichtlinie ist maximal eine Anfrage pro Sekunde erlaubt, daher wird
-    nach jeder tatsächlichen Netzwerkanfrage kurz gewartet. Ist proxy_server
-    gesetzt (z. B. im Firmennetz erforderlich), wird er für die Anfrage genutzt.
-    """
-    if not address:
-        return None
-    key = address.strip().lower()
-    if key in cache:
-        value = cache[key]
-        return (value[0], value[1]) if value else None
-
-    query = urllib.parse.urlencode({"format": "json", "q": address, "limit": 1})
-    request = urllib.request.Request(
-        f"{NOMINATIM_URL}?{query}",
-        headers={"User-Agent": "Stellensuche-intern/1.0 (internes Tool)"},
-    )
-    try:
-        if proxy_server:
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy_server, "https": proxy_server})
-            )
-            resp = opener.open(request, timeout=10)
-        else:
-            resp = urllib.request.urlopen(request, timeout=10)
-        with resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError):
-        cache[key] = None
-        return None
-    finally:
-        time.sleep(1)
-
-    if not data:
-        cache[key] = None
-        return None
-
-    try:
-        lat = float(data[0]["lat"])
-        lon = float(data[0]["lon"])
-    except (KeyError, ValueError, TypeError):
-        cache[key] = None
-        return None
-
-    cache[key] = [lat, lon]
-    return lat, lon
-
-
 def html_to_text(fragment: str) -> str:
     """Wandelt einen HTML-Textblock in reinen, lesbaren Text um."""
     if not fragment:
@@ -494,37 +429,100 @@ def fetch_job_detail(page, uuid: str) -> dict:
     return _page_fetch_json(page, f"{DETAIL_API}/{uuid}")
 
 
-# EG-Einstufungen (tarifliche Entgeltgruppen) erhalten als Rang direkt ihre Zahl
-# (EG12 -> 12, EG16 -> 16, ...). Die außertariflichen Führungsstufen SL1/SL2/SL3
-# liegen darüber, mit SL1 < SL2 < SL3 (Rang 101-103), unabhängig von der
-# höchsten vorkommenden EG-Zahl. Die Einstufung steht i. d. R. im Jobtitel
-# (z. B. "... (EG16, w/m/div.)" oder "..., SL1"), daher wird sowohl der Titel
-# als auch der Stellentext durchsucht.
+# Einstufungs-Schienen, die im Jobtitel/-text vorkommen:
+#   - EG (tariflich, Entgeltgruppen): Rang = EG-Zahl (EG12 -> 12, EG16 -> 16, ...)
+#   - SL (außertarifliche Führungskräfte SL1/SL2/SL3): Rang 101-103, immer
+#     höher als jede EG-Zahl.
+#   - PC (englischsprachige Stellen, im Titel oft "analog upper tariff / PC06"
+#     - eine außertarifliche Fachlaufbahn): Rang = 300 + Zahl.
+#   Die 300er-Basis für PC ist eine vorläufige Platzhalter-Einordnung (steht
+#   noch offen, wie sich PC-Stufen zu EG/SL tatsächlich verhalten - siehe
+#   TODO.md), einfach anpassbar, sobald das geklärt ist.
+#
+#   - E (außertarifliche Fachlaufbahn "E01".."E16"): Rang = 200 + Zahl. War
+#     AUSKOMMENTIERT ("laut Rücksprache scheint es diese Schiene so nicht zu
+#     geben"), jetzt anhand einer Analyse von alle_stellen_de.json (bundesweite
+#     Stellenliste) REAKTIVIERT - 53 echte Titel mit E01..E16 gefunden, u. a.
+#     "Safety Expert (E06, w/m/div.)", "HR Expert Talent Management (E16, ...)".
+#   - TARIF (gewerbliche Tarifstufen ohne EG-Nummer: "unterer"/"mittlerer"/
+#     "oberer Tarif", engl. "upper tariff"): Rang = 400 + Zahl (unterer=1,
+#     mittlerer=2, oberer=3). Ebenfalls anhand alle_stellen_de.json ergänzt -
+#     86 echte Titel gefunden, u. a. auch als Bereich ("unterer/mittlerer
+#     Tarif") oder kombiniert mit SL ("Oberer Tarif/SL1").
+#
+# Manche Titel nennen mehrere Einstufungen zugleich (z. B. "EG16/SL1" bei
+# außertariflichen Verträgen, die je nach Kandidat:in tariflich oder
+# außertariflich besetzt werden) - dann werden alle im selben Text gefundenen
+# Einstufungen zu einem kombinierten Label zusammengefasst, der höchste Rang
+# zählt für Vergleiche/Filter.
 _EG_SL_PATTERN = re.compile(
-    r"\bEG\s*-?\s*(?P<eg>\d{1,2})\b|\bSL\s*-?\s*(?P<sl>\d)\b",
+    r"\bEG\s*-?\s*(?P<eg>\d{1,2})\b|\bSL\s*-?\s*(?P<sl>\d)\b"
+    r"|\bPC\s*-?\s*(?P<pc>\d{1,2})\b"
+    r"|\bE\s*-?\s*(?P<e>\d{1,2})\b",
+    re.IGNORECASE,
+)
+
+# "unterer"/"mittlerer"/"oberer Tarif" (bzw. engl. "upper tariff") - eigene
+# Schiene für gewerbliche/administrative Stellen ohne EG-Nummer. Mehrere durch
+# "/" getrennte Stufen vor einem gemeinsamen "Tarif" (z. B. "unterer/mittlerer
+# Tarif") werden als Bereich erfasst, ebenso mehrfach im selben Titel
+# auftretende "... Tarif / ... Tarif"-Angaben (jeweils eigener Regex-Treffer).
+_TARIF_WORT_ZU_NUMMER = {"unterer": 1, "mittlerer": 2, "oberer": 3, "upper": 3}
+_TARIF_PATTERN = re.compile(
+    r"\b(?P<stufen>(?:unterer|mittlerer|oberer|upper)"
+    r"(?:\s*/\s*(?:unterer|mittlerer|oberer|upper))*)\s+tariff?\b",
     re.IGNORECASE,
 )
 
 
 def extract_eg_einstufung(*texts: str) -> tuple[str | None, int | None]:
-    """Sucht in den übergebenen Texten (z. B. Jobtitel, Stellentext) nach einer
-    EG- oder SL-Einstufung.
+    """Sucht in den übergebenen Texten (z. B. Jobtitel, Stellentext) nach
+    EG-, SL- oder PC-Einstufung(en).
 
-    Gibt ein Label ("EG13", "SL2") und einen numerischen Rang für Vergleiche
-    zurück (EG-Rang = EG-Zahl, SL1=101, SL2=102, SL3=103 - immer höher als
-    jede EG-Zahl). Wird nichts gefunden, wird (None, None) zurückgegeben.
+    Durchsucht die Texte der Reihe nach (i. d. R. zuerst der Jobtitel) und
+    nimmt den ERSTEN Text, in dem mindestens ein Treffer steckt - findet
+    dieser Text mehrere unterschiedliche Einstufungen (z. B. "EG16/SL1"),
+    werden alle als kombiniertes Label ("EG16/SL1") zurückgegeben, wobei der
+    höchste Rang für Vergleiche/Filter zählt. Wird nichts gefunden, wird
+    (None, None) zurückgegeben.
     """
     for text in texts:
         if not text:
             continue
-        match = _EG_SL_PATTERN.search(text)
-        if not match:
+        found: list[tuple[str, int]] = []
+        seen_labels: set[str] = set()
+        for match in _EG_SL_PATTERN.finditer(text):
+            if match.group("eg"):
+                n = int(match.group("eg"))
+                label, rang = f"EG{n}", n
+            elif match.group("sl"):
+                n = int(match.group("sl"))
+                label, rang = f"SL{n}", 100 + n
+            elif match.group("pc"):
+                n = int(match.group("pc"))
+                label, rang = f"PC{n:02d}", 300 + n
+            elif match.group("e"):
+                n = int(match.group("e"))
+                label, rang = f"E{n:02d}", 200 + n
+            else:
+                continue
+            if label not in seen_labels:
+                seen_labels.add(label)
+                found.append((label, rang))
+        for match in _TARIF_PATTERN.finditer(text):
+            for wort in match.group("stufen").split("/"):
+                n = _TARIF_WORT_ZU_NUMMER.get(wort.strip().lower())
+                if n is None:
+                    continue
+                label, rang = f"TARIF{n}", 400 + n
+                if label not in seen_labels:
+                    seen_labels.add(label)
+                    found.append((label, rang))
+        if not found:
             continue
-        if match.group("eg"):
-            n = int(match.group("eg"))
-            return f"EG{n}", n
-        n = int(match.group("sl"))
-        return f"SL{n}", 100 + n
+        combined_label = "/".join(label for label, _ in found)
+        max_rang = max(rang for _, rang in found)
+        return combined_label, max_rang
     return None, None
 
 
@@ -560,441 +558,6 @@ def build_record(detail: dict, matched_begriffe: list[str]) -> dict:
         "url": f"{JOBS_URL}/{uuid}",
         "abgerufen_am": datetime.now().isoformat(timespec="seconds"),
     }
-
-
-def _format_date(value) -> str:
-    """Formatiert ein Datumsfeld (dict mit year/month/day[/hour/minute] oder String) zu DD.MM.YYYY [HH:MM]."""
-    if not value:
-        return ""
-    if isinstance(value, dict):
-        try:
-            date_str = f"{value['day']:02d}.{value['month']:02d}.{value['year']}"
-            if "hour" in value and "minute" in value:
-                date_str += f" {value['hour']:02d}:{value['minute']:02d}"
-            return date_str
-        except (KeyError, TypeError, ValueError):
-            return str(value)
-    return str(value)
-
-
-def build_html_page(records: list[dict], map_filename: str | None = None) -> str:
-    """Erzeugt eine übersichtliche, eigenständige HTML-Seite aus den Job-Records.
-
-    Enthält eine "Beworben"-Checkbox pro Stelle (Status wird im Browser via
-    localStorage gespeichert und bleibt so auch nach erneutem Erzeugen der
-    Seite erhalten) sowie einen Button zum Herunterladen der Stellenanzeige
-    als .txt-Datei.
-    """
-    generated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-    cards = []
-    jobs_data: dict[str, dict[str, str]] = {}
-    for idx, rec in enumerate(records):
-        title = html.escape(rec.get("jobtitel") or "")
-        url = html.escape(rec.get("url") or "#")
-        ort = html.escape(rec.get("ort") or "")
-        region = html.escape(rec.get("region") or "")
-        land = html.escape(rec.get("land") or "")
-        anstellungsart = html.escape(rec.get("anstellungsart") or "")
-        unternehmen = html.escape(rec.get("unternehmen") or "")
-        aktualisiert = html.escape(_format_date(rec.get("aktualisiert")))
-        begriffe = rec.get("gefundene_suchbegriffe") or []
-        tags = "".join(f'<span class="tag">{html.escape(b)}</span>' for b in begriffe)
-        stellentext_raw = rec.get("stellentext") or ""
-        stellentext = html.escape(stellentext_raw).replace("\n", "<br>")
-        eg_label = rec.get("eg_einstufung")
-        eg_rang = rec.get("eg_rang")
-        eg_rang_attr = str(eg_rang) if eg_rang is not None else ""
-        eg_tag = f'<span class="tag eg-tag">{html.escape(eg_label)}</span>' if eg_label else ""
-
-        job_id = html.escape((rec.get("url") or f"job-{idx}").rsplit("/", 1)[-1] or f"job-{idx}")
-        jobs_data[job_id] = {
-            "title": rec.get("jobtitel") or "",
-            "text": stellentext_raw,
-        }
-
-        meta_parts = [p for p in (ort, region, land) if p]
-        meta_line = ", ".join(meta_parts)
-
-        cards.append(f"""
-        <article class="card" id="card_{job_id}" data-eg-rang="{eg_rang_attr}">
-            <h2><a href="{url}" target="_blank" rel="noopener">{title}</a></h2>
-            <div class="meta">
-                {f'<span>📍 {meta_line}</span>' if meta_line else ''}
-                {f'<span>🏢 {unternehmen}</span>' if unternehmen else ''}
-                {f'<span>💼 {anstellungsart}</span>' if anstellungsart else ''}
-                {f'<span>🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
-            </div>
-            <div class="tags">{eg_tag}{tags}</div>
-            <div class="actions">
-                <label class="beworben-label">
-                    <input type="checkbox" class="beworben-checkbox" data-id="{job_id}">
-                    Beworben
-                </label>
-                <button type="button" class="download-btn" data-id="{job_id}">⬇️ Als TXT herunterladen</button>
-            </div>
-            <details>
-                <summary>Stellenbeschreibung anzeigen</summary>
-                <div class="stellentext">{stellentext}</div>
-            </details>
-        </article>""")
-
-    cards_html = "\n".join(cards) if cards else '<p class="empty">Keine passenden Stellen gefunden.</p>'
-    jobs_data_json = json.dumps(jobs_data, ensure_ascii=False).replace("</", "<\\/")
-
-    eg_level_options = "".join(f'<option value="{n}">EG{n}</option>' for n in range(1, 19))
-    eg_level_options += "".join(f'<option value="{100 + n}">SL{n}</option>' for n in range(1, 4))
-
-
-    return f"""<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bosch Stellensuche – Ergebnisse</title>
-<style>
-    :root {{ color-scheme: light dark; }}
-    body {{
-        font-family: "Segoe UI", Arial, sans-serif;
-        max-width: 900px;
-        margin: 0 auto;
-        padding: 24px;
-        background: #f4f5f7;
-        color: #1a1a1a;
-    }}
-    header {{ margin-bottom: 24px; }}
-    header h1 {{ margin-bottom: 4px; }}
-    header p {{ color: #555; margin: 0; }}
-    .card {{
-        background: #fff;
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 16px 20px;
-        margin-bottom: 16px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    }}
-    .card.applied {{
-        opacity: 0.6;
-        border-left: 4px solid #2e7d32;
-    }}
-    .card h2 {{ margin: 0 0 8px 0; font-size: 1.15rem; }}
-    .card h2 a {{ color: #005691; text-decoration: none; }}
-    .card h2 a:hover {{ text-decoration: underline; }}
-    .meta {{
-        display: flex;
-        flex-wrap: wrap;
-        gap: 12px;
-        color: #444;
-        font-size: 0.9rem;
-        margin-bottom: 8px;
-    }}
-    .tags {{ margin-bottom: 8px; }}
-    .tag {{
-        display: inline-block;
-        background: #e8f1f8;
-        color: #005691;
-        border-radius: 12px;
-        padding: 2px 10px;
-        font-size: 0.8rem;
-        margin: 2px 4px 2px 0;
-    }}
-    .actions {{
-        display: flex;
-        align-items: center;
-        gap: 16px;
-        margin-bottom: 8px;
-        font-size: 0.9rem;
-    }}
-    .beworben-label {{ display: flex; align-items: center; gap: 6px; cursor: pointer; }}
-    .download-btn {{
-        background: #005691;
-        color: #fff;
-        border: none;
-        border-radius: 6px;
-        padding: 6px 12px;
-        font-size: 0.85rem;
-        cursor: pointer;
-    }}
-    .download-btn:hover {{ background: #00426d; }}
-    details summary {{
-        cursor: pointer;
-        color: #005691;
-        font-size: 0.9rem;
-    }}
-    .stellentext {{
-        margin-top: 10px;
-        font-size: 0.9rem;
-        line-height: 1.5;
-        color: #333;
-    }}
-    .empty {{ color: #777; }}
-    .eg-tag {{ background: #fdecea; color: #a13a2a; }}
-    .filterbar {{
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 10px;
-        background: #fff;
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 10px 14px;
-        margin-bottom: 16px;
-        font-size: 0.9rem;
-    }}
-    .filterbar label {{ display: flex; align-items: center; gap: 6px; }}
-    .filterbar select {{ padding: 4px 6px; }}
-    .filterbar .reset-btn {{
-        background: none;
-        border: 1px solid #005691;
-        color: #005691;
-        border-radius: 6px;
-        padding: 4px 10px;
-        cursor: pointer;
-        font-size: 0.85rem;
-    }}
-    .filterbar .reset-btn:hover {{ background: #e8f1f8; }}
-    .filter-count {{ color: #555; }}
-</style>
-</head>
-<body>
-<header>
-    <h1>Bosch Stellensuche – Ergebnisse</h1>
-    <p>{len(records)} passende Stelle(n) &middot; erzeugt am {generated_at}{f' &middot; <a href="{html.escape(map_filename)}">🗺️ Karte anzeigen</a>' if map_filename else ''}</p>
-</header>
-<div class="filterbar">
-    <label>EG/SL-Einstufung
-        <select id="eg-operator">
-            <option value="=">=</option>
-            <option value="<">&lt;</option>
-            <option value="<=">&le;</option>
-            <option value=">">&gt;</option>
-            <option value=">=">&ge;</option>
-            <option value="between">zwischen</option>
-        </select>
-    </label>
-    <label>
-        <select id="eg-level">
-            <option value="">Alle Stufen</option>
-            {eg_level_options}
-        </select>
-    </label>
-    <label id="eg-level-2-label" style="display:none;">und
-        <select id="eg-level-2">
-            <option value="">...</option>
-            {eg_level_options}
-        </select>
-    </label>
-    <button type="button" class="reset-btn" id="eg-reset">Filter zurücksetzen</button>
-    <span class="filter-count" id="eg-filter-count"></span>
-</div>
-<main>
-{cards_html}
-</main>
-<script>
-const JOBS_DATA = {jobs_data_json};
-
-function sanitizeFilename(name) {{
-    return name.replace(/[\\\\/:*?"<>|]/g, "_").trim() || "stellenanzeige";
-}}
-
-function downloadTxt(id) {{
-    const job = JOBS_DATA[id];
-    if (!job) return;
-    const content = job.title + "\\n\\n" + job.text;
-    const blob = new Blob([content], {{ type: "text/plain;charset=utf-8" }});
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = sanitizeFilename(job.title) + ".txt";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
-}}
-
-document.addEventListener("DOMContentLoaded", () => {{
-    document.querySelectorAll(".beworben-checkbox").forEach((cb) => {{
-        const id = cb.dataset.id;
-        const card = document.getElementById("card_" + id);
-        if (localStorage.getItem("beworben_" + id) === "1") {{
-            cb.checked = true;
-            if (card) card.classList.add("applied");
-        }}
-        cb.addEventListener("change", () => {{
-            localStorage.setItem("beworben_" + id, cb.checked ? "1" : "0");
-            if (card) card.classList.toggle("applied", cb.checked);
-        }});
-    }});
-
-    document.querySelectorAll(".download-btn").forEach((btn) => {{
-        btn.addEventListener("click", () => downloadTxt(btn.dataset.id));
-    }});
-
-    const opSelect = document.getElementById("eg-operator");
-    const levelSelect = document.getElementById("eg-level");
-    const level2Select = document.getElementById("eg-level-2");
-    const level2Label = document.getElementById("eg-level-2-label");
-    const resetBtn = document.getElementById("eg-reset");
-    const countLabel = document.getElementById("eg-filter-count");
-    const allCards = Array.from(document.querySelectorAll(".card"));
-
-    function compare(rang, op, target, target2) {{
-        switch (op) {{
-            case "=": return rang === target;
-            case "<": return rang < target;
-            case "<=": return rang <= target;
-            case ">": return rang > target;
-            case ">=": return rang >= target;
-            case "between": {{
-                const lo = Math.min(target, target2);
-                const hi = Math.max(target, target2);
-                return rang >= lo && rang <= hi;
-            }}
-            default: return true;
-        }}
-    }}
-
-    function applyEgFilter() {{
-        const op = opSelect.value;
-        const target = levelSelect.value;
-        const target2 = level2Select.value;
-        level2Label.style.display = op === "between" ? "" : "none";
-
-        const filterActive = op === "between" ? (target !== "" && target2 !== "") : target !== "";
-        let visible = 0;
-        allCards.forEach((card) => {{
-            let show = true;
-            if (filterActive) {{
-                const rawRang = card.dataset.egRang;
-                if (rawRang === "") {{
-                    show = false;
-                }} else if (op === "between") {{
-                    show = compare(parseInt(rawRang, 10), op, parseInt(target, 10), parseInt(target2, 10));
-                }} else {{
-                    show = compare(parseInt(rawRang, 10), op, parseInt(target, 10));
-                }}
-            }}
-            card.style.display = show ? "" : "none";
-            if (show) visible++;
-        }});
-        countLabel.textContent = filterActive
-            ? `${{visible}} von ${{allCards.length}} Stellen passen zum Filter`
-            : "";
-    }}
-
-    opSelect.addEventListener("change", applyEgFilter);
-    levelSelect.addEventListener("change", applyEgFilter);
-    level2Select.addEventListener("change", applyEgFilter);
-    resetBtn.addEventListener("click", () => {{
-        levelSelect.value = "";
-        level2Select.value = "";
-        opSelect.value = "=";
-        applyEgFilter();
-    }});
-}});
-</script>
-</body>
-</html>
-"""
-
-
-def build_map_page(records: list[dict], geocode_cache: dict, proxy_server: str | None = None) -> str:
-    """Erzeugt eine eigenständige HTML-Seite mit einer Karte (Leaflet/OSM),
-    auf der jede Stelle als Punkt an ihrem Standort eingeblendet wird.
-
-    Adressen werden über den übergebenen Geocoding-Cache aufgelöst (siehe
-    geocode_address). Mehrere Stellen am selben Ort werden zu einem
-    gemeinsamen Marker zusammengefasst.
-    """
-    generated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-    points: dict[str, dict] = {}
-    missing = 0
-    for rec in records:
-        ort = (rec.get("ort") or "").strip()
-        if not ort:
-            missing += 1
-            continue
-        coords = geocode_address(ort, geocode_cache, proxy_server=proxy_server)
-        if not coords:
-            missing += 1
-            continue
-        lat, lon = coords
-        key = f"{lat:.5f},{lon:.5f}"
-        entry = points.setdefault(key, {"lat": lat, "lon": lon, "ort": ort, "jobs": []})
-        entry["jobs"].append({
-            "title": rec.get("jobtitel") or "",
-            "url": rec.get("url") or "#",
-        })
-
-    markers = list(points.values())
-    markers_json = json.dumps(markers, ensure_ascii=False).replace("</", "<\\/")
-
-    return f"""<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bosch Stellensuche \u2013 Karte</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<style>
-    :root {{ color-scheme: light dark; }}
-    body {{
-        font-family: "Segoe UI", Arial, sans-serif;
-        margin: 0;
-        padding: 0;
-        color: #1a1a1a;
-    }}
-    header {{
-        padding: 16px 24px;
-        background: #fff;
-        border-bottom: 1px solid #e0e0e0;
-    }}
-    header h1 {{ margin: 0 0 4px 0; font-size: 1.3rem; }}
-    header p {{ color: #555; margin: 0; font-size: 0.9rem; }}
-    header a {{ color: #005691; text-decoration: none; }}
-    header a:hover {{ text-decoration: underline; }}
-    #map {{ height: calc(100vh - 78px); width: 100%; }}
-    .popup-jobs {{ margin: 6px 0 0 0; padding-left: 18px; }}
-    .popup-jobs li {{ margin-bottom: 4px; }}
-</style>
-</head>
-<body>
-<header>
-    <h1>Bosch Stellensuche \u2013 Karte</h1>
-    <p>{len(markers)} Standort(e) &middot; {len(records)} passende Stelle(n)
-        {f' &middot; {missing} ohne ermittelbaren Standort' if missing else ''}
-        &middot; erzeugt am {generated_at} &middot; <a href="javascript:history.back()">\u2190 Zur\u00fcck zur Liste</a></p>
-</header>
-<div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-const MARKERS = {markers_json};
-
-const map = L.map('map').setView([51.1657, 10.4515], 6);
-L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'
-}}).addTo(map);
-
-const bounds = [];
-MARKERS.forEach((pt) => {{
-    bounds.push([pt.lat, pt.lon]);
-    const jobsHtml = pt.jobs.map((j) => {{
-        const safeTitle = j.title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        return `<li><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a></li>`;
-    }}).join("");
-    const safeOrt = pt.ort.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const popupHtml = `<strong>${{safeOrt}}</strong><ul class="popup-jobs">${{jobsHtml}}</ul>`;
-    L.marker([pt.lat, pt.lon]).addTo(map).bindPopup(popupHtml);
-}});
-
-if (bounds.length) {{
-    map.fitBounds(bounds, {{ padding: [30, 30] }});
-}}
-</script>
-</body>
-</html>
-"""
 
 
 def main() -> None:
@@ -1067,28 +630,13 @@ def main() -> None:
     )
     print(f"\n{len(records)} passende Stellen gespeichert in: {output_path}")
 
-    html_output_path = (
-        SCRIPT_DIR / args.html_output if args.html_output else output_path.with_suffix(".html")
+    # HTML-/Kartenansicht übernimmt stellen_verarbeitung.py (separat testbar
+    # gegen jede bereits vorhandene JSON-Datei, ganz ohne Playwright/Login).
+    stellen_verarbeitung.process_records(
+        records, output_path,
+        html_output=args.html_output, map_output=args.map_output,
+        no_map=args.no_map, proxy_server=proxy_server,
     )
-    map_output_path = (
-        SCRIPT_DIR / args.map_output if args.map_output
-        else output_path.parent / f"{output_path.stem}_karte.html"
-    )
-
-    map_filename = None
-    if not args.no_map:
-        print("\nErmittle Standorte für die Kartenansicht (Geocoding via OpenStreetMap)...")
-        geocode_cache = load_geocode_cache()
-        try:
-            map_html = build_map_page(records, geocode_cache, proxy_server=proxy_server)
-        finally:
-            save_geocode_cache(geocode_cache)
-        map_output_path.write_text(map_html, encoding="utf-8")
-        print(f"Kartenansicht gespeichert in: {map_output_path}")
-        map_filename = map_output_path.name
-
-    html_output_path.write_text(build_html_page(records, map_filename=map_filename), encoding="utf-8")
-    print(f"HTML-Übersicht gespeichert in: {html_output_path}")
 
 
 if __name__ == "__main__":
