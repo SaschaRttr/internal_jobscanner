@@ -1,0 +1,4 @@
+"C:\Program Files\Miniforge\python.exe" stellensuche.py
+
+cd "c:\Users\rue1bb\Documents\Documents\Python\Stellensuche_intern"
+powershell -File build_exe.ps1
