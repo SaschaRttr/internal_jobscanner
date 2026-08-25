@@ -2,6 +2,8 @@
 bosch_jobs_gefiltert.json
 bosch_jobs_gefiltert.html
 bosch_jobs_gefiltert_karte.html
+bosch_jobs_gefiltert_scan_state.json
+alle_stellen_de.json
 geocode_cache.json
 __pycache__/
 *.pyc

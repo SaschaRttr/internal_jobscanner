@@ -168,6 +168,104 @@ def _format_date(value) -> str:
     return str(value)
 
 
+def _date_to_iso(value) -> str:
+    """Wandelt ein Datumsfeld (dict mit year/month/day[/hour/minute] oder String,
+    siehe _format_date()) in einen von JS parsbaren ISO-String um, für den
+    Zeitraum-Filter (Vergleich mit new Date(...) im Browser)."""
+    if not value:
+        return ""
+    if isinstance(value, dict):
+        try:
+            return (
+                f"{value['year']:04d}-{value['month']:02d}-{value['day']:02d}"
+                f"T{value.get('hour', 0):02d}:{value.get('minute', 0):02d}:00"
+            )
+        except (KeyError, TypeError, ValueError):
+            return ""
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _load_scan_state(path: Path) -> dict:
+    """Lädt den Zustand des vorherigen Laufs für diese Eingabedatei (Zeitpunkt
+    für den Zeitraum-Filter "Neu seit letztem Scan" + Job-Store für den
+    Verfügbarkeits-Abgleich, siehe _merge_job_store). Gibt {} zurück, wenn noch
+    kein vorheriger Lauf bekannt ist (z. B. beim allerersten Aufruf)."""
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_scan_state(path: Path, state: dict) -> None:
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# Wie viele Tage eine verschwundene Stelle noch (ausgegraut/eingeklappt) in der
+# Ansicht auftaucht, bevor sie endgültig aus dem Job-Store entfernt wird -
+# ansonsten würde der Store (und damit die _scan_state.json) unbegrenzt wachsen.
+UNAVAILABLE_RETENTION_DAYS = 30
+
+
+def _days_since(iso_ts: str | None, now_iso: str) -> float:
+    if not iso_ts:
+        return 0.0
+    try:
+        return (datetime.fromisoformat(now_iso) - datetime.fromisoformat(iso_ts)).total_seconds() / 86400
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _merge_job_store(
+    current_records: list[dict], previous_jobs: dict, current_scan_at: str
+) -> tuple[list[dict], dict]:
+    """Reichert die aktuell gescrapten Stellen um solche an, die im letzten
+    Lauf noch da waren, jetzt aber aus dem Scan verschwunden sind (= vermutlich
+    vergeben oder offline genommen).
+
+    Verschwundene Stellen bekommen `_verfuegbar=False` und werden mit ihren
+    zuletzt bekannten Daten weitergereicht, damit build_html_page/
+    build_map_page sie ausgegraut/eingeklappt statt einfach unsichtbar
+    anzeigen können. Nach UNAVAILABLE_RETENTION_DAYS werden sie endgültig aus
+    dem zurückgegebenen Store entfernt.
+
+    Gibt (alle_records, neuer_job_store) zurück; alle_records enthält zuerst
+    die aktuell verfügbaren, danach die (noch nicht abgelaufenen) nicht mehr
+    verfügbaren Stellen.
+    """
+    new_store: dict[str, dict] = {}
+    all_records: list[dict] = []
+    current_ids: set[str] = set()
+
+    for idx, rec in enumerate(current_records):
+        job_id = _job_id(rec, idx)
+        current_ids.add(job_id)
+        new_store[job_id] = {"record": rec, "zuletzt_gesehen": current_scan_at}
+        merged = dict(rec)
+        merged["_verfuegbar"] = True
+        all_records.append(merged)
+
+    for job_id, entry in previous_jobs.items():
+        if job_id in current_ids:
+            continue
+        seit_wann_weg = entry.get("seit_wann_nicht_verfuegbar") or entry.get("zuletzt_gesehen") or current_scan_at
+        if _days_since(seit_wann_weg, current_scan_at) > UNAVAILABLE_RETENTION_DAYS:
+            continue
+        new_store[job_id] = {
+            "record": entry.get("record", {}),
+            "zuletzt_gesehen": entry.get("zuletzt_gesehen"),
+            "seit_wann_nicht_verfuegbar": seit_wann_weg,
+        }
+        merged = dict(entry.get("record", {}))
+        merged["_verfuegbar"] = False
+        all_records.append(merged)
+
+    return all_records, new_store
+
+
 def _job_id(rec: dict, idx: int) -> str:
     """Leitet eine stabile Kennung für eine Stelle aus ihrer URL ab (für localStorage-Keys).
 
@@ -296,6 +394,36 @@ def _parse_eg_label(label: str | None) -> list[tuple[str, int]]:
     return result
 
 
+# Ortsfilter - filtert nach der Stadt statt nach der vollen Adresse im
+# "ort"-Feld (z. B. "Gerhard-Kindler-Str. 9, 72770 Reutlingen, Deutschland").
+# So werden mehrere Standorte mit unterschiedlicher Adresse in derselben
+# Stadt (z. B. zwei Standorte in Stuttgart) unter einem Filterwert
+# zusammengefasst. Sammel-Angaben mit mehreren möglichen Einsatzorten
+# (" / "-getrennt, siehe PREFERRED_MULTI_LOCATION_CITY weiter unten) liefern
+# alle genannten Städte, damit die Stelle unter jeder von ihnen auffindbar ist.
+_PLZ_ORT_RE = re.compile(r"^\d{4,6}\s+(.+)$")
+
+
+def _extract_ort_cities(ort: str) -> list[str]:
+    parts = [p.strip() for p in (ort or "").split(",") if p.strip()]
+    if not parts:
+        return []
+    kandidat = parts[1] if len(parts) > 1 else parts[0]
+    match = _PLZ_ORT_RE.match(kandidat)
+    if match:
+        kandidat = match.group(1)
+    if " / " in kandidat:
+        return [c.strip() for c in kandidat.split(" / ") if c.strip()]
+    return [kandidat] if kandidat else []
+
+
+def _collect_ort_options(records: list[dict]) -> list[str]:
+    cities: set[str] = set()
+    for rec in records:
+        cities.update(_extract_ort_cities(rec.get("ort") or ""))
+    return sorted(cities, key=str.casefold)
+
+
 # Filter für den Bewerbungsstatus (siehe STATUS_OPTIONS) - "any" fasst
 # "möchte mich bewerben" und "beworben" zusammen ("gemerkt oder beworben").
 STATUS_FILTER_OPTIONS = [
@@ -306,10 +434,13 @@ STATUS_FILTER_OPTIONS = [
 ]
 
 
-def _eg_filterbar_html() -> str:
+def _eg_filterbar_html(ort_options: list[str] | None = None) -> str:
     eg_level_options = _eg_level_options_html()
     status_filter_options = "".join(
         f'<option value="{value}">{label}</option>' for value, label in STATUS_FILTER_OPTIONS
+    )
+    ort_filter_options = "".join(
+        f'<option value="{html.escape(ort)}">{html.escape(ort)}</option>' for ort in (ort_options or [])
     )
     return f"""<div class="filterbar">
     <label>Einstufung
@@ -339,6 +470,23 @@ def _eg_filterbar_html() -> str:
             {status_filter_options}
         </select>
     </label>
+    <label>Ort
+        <select id="ort-filter">
+            <option value="">Alle Orte</option>
+            {ort_filter_options}
+        </select>
+    </label>
+    <label>Zeitraum
+        <select id="zeit-filter">
+            <option value="">Alle</option>
+            <option value="scan">Neu seit letztem Scan</option>
+            <option value="tage">Letzte ... Tage</option>
+            <option value="wochen">Letzte ... Wochen</option>
+        </select>
+    </label>
+    <label id="zeit-anzahl-label" style="display:none;">
+        <input type="number" id="zeit-anzahl" min="1" value="7">
+    </label>
     <button type="button" class="reset-btn" id="eg-reset">Filter zurücksetzen</button>
     <span class="filter-count" id="eg-filter-count"></span>
 </div>"""
@@ -361,6 +509,7 @@ _FILTERBAR_CSS = """
     }
     .filterbar label { display: flex; align-items: center; gap: 6px; }
     .filterbar select { padding: 4px 6px; }
+    .filterbar input[type="number"] { width: 60px; padding: 4px 6px; }
     .filterbar .reset-btn {
         background: none;
         border: 1px solid #005691;
@@ -468,6 +617,17 @@ function statusMatches(status, filterValue) {{
     return status === filterValue;
 }}
 
+function parseOrtCities(raw) {{
+    if (!raw) return [];
+    if (Array.isArray(raw)) return raw;
+    return raw.split("|").filter(Boolean);
+}}
+
+function ortMatches(rawOrtCities, filterValue) {{
+    if (!filterValue) return true;
+    return parseOrtCities(rawOrtCities).includes(filterValue);
+}}
+
 function wireEgFilterControls(onChange) {{
     const levelSelect = document.getElementById("eg-level");
     levelSelect.addEventListener("change", () => {{
@@ -477,11 +637,16 @@ function wireEgFilterControls(onChange) {{
     document.getElementById("eg-operator").addEventListener("change", onChange);
     document.getElementById("eg-level-2").addEventListener("change", onChange);
     document.getElementById("status-filter").addEventListener("change", onChange);
+    document.getElementById("ort-filter").addEventListener("change", onChange);
     document.getElementById("eg-reset").addEventListener("click", () => {{
         levelSelect.value = "";
         populateLevel2Options();
         document.getElementById("eg-operator").value = "=";
         document.getElementById("status-filter").value = "";
+        document.getElementById("ort-filter").value = "";
+        document.getElementById("zeit-filter").value = "";
+        document.getElementById("zeit-anzahl").value = "7";
+        readZeitFilterState();
         onChange();
     }});
     populateLevel2Options();
@@ -489,7 +654,62 @@ function wireEgFilterControls(onChange) {{
 """
 
 
-def build_html_page(records: list[dict], map_filename: str | None = None) -> str:
+# Zeitraum-Filter (Liste + Karte) - vergleicht das "aktualisiert"-Datum jeder
+# Stelle entweder gegen den Zeitpunkt des vorherigen Laufs ("Neu seit letztem
+# Scan", siehe _load_scan_state/_save_scan_state) oder gegen "jetzt minus
+# X Tage/Wochen". PREVIOUS_SCAN_AT wird als Konstante eingebettet, weil der
+# Vergleichszeitpunkt (Zeitpunkt des vorherigen Skript-Laufs) sich nicht aus
+# den Job-Daten selbst ableiten lässt.
+def _zeit_filter_script(previous_scan_at: str | None) -> str:
+    previous_scan_json = json.dumps(previous_scan_at)
+    return f"""
+const PREVIOUS_SCAN_AT = {previous_scan_json};
+
+function readZeitFilterState() {{
+    const modeSelect = document.getElementById("zeit-filter");
+    const anzahlLabel = document.getElementById("zeit-anzahl-label");
+    const anzahlInput = document.getElementById("zeit-anzahl");
+    const mode = modeSelect.value;
+    anzahlLabel.style.display = (mode === "tage" || mode === "wochen") ? "" : "none";
+
+    if (mode === "scan") {{
+        if (!PREVIOUS_SCAN_AT) return {{ active: false, cutoff: null }};
+        return {{ active: true, cutoff: new Date(PREVIOUS_SCAN_AT) }};
+    }}
+    if (mode === "tage" || mode === "wochen") {{
+        const anzahl = parseInt(anzahlInput.value, 10);
+        if (!anzahl || anzahl < 1) return {{ active: false, cutoff: null }};
+        const tage = mode === "wochen" ? anzahl * 7 : anzahl;
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - tage);
+        return {{ active: true, cutoff }};
+    }}
+    return {{ active: false, cutoff: null }};
+}}
+
+function zeitMatches(rawDate, zeitFilterState) {{
+    if (!zeitFilterState.active) return true;
+    if (!rawDate) return false;
+    const parsed = new Date(rawDate);
+    if (isNaN(parsed.getTime())) return false;
+    return parsed >= zeitFilterState.cutoff;
+}}
+
+function wireZeitFilterControls(onChange) {{
+    document.getElementById("zeit-filter").addEventListener("change", () => {{
+        readZeitFilterState();
+        onChange();
+    }});
+    document.getElementById("zeit-anzahl").addEventListener("input", onChange);
+}}
+"""
+
+
+def build_html_page(
+    records: list[dict],
+    map_filename: str | None = None,
+    previous_scan_at: str | None = None,
+) -> str:
     """Erzeugt eine übersichtliche, eigenständige HTML-Seite aus den Job-Records.
 
     Enthält ein Status-Dropdown (Kein Status / Möchte mich bewerben / Beworben)
@@ -505,12 +725,15 @@ def build_html_page(records: list[dict], map_filename: str | None = None) -> str
     for idx, rec in enumerate(records):
         title = html.escape(rec.get("jobtitel") or "")
         url = html.escape(rec.get("url") or "#")
-        ort = html.escape(rec.get("ort") or "")
+        ort_raw = rec.get("ort") or ""
+        ort = html.escape(ort_raw)
+        ort_city_attr = html.escape("|".join(_extract_ort_cities(ort_raw)))
         region = html.escape(rec.get("region") or "")
         land = html.escape(rec.get("land") or "")
         anstellungsart = html.escape(rec.get("anstellungsart") or "")
         unternehmen = html.escape(rec.get("unternehmen") or "")
         aktualisiert = html.escape(_format_date(rec.get("aktualisiert")))
+        aktualisiert_iso = html.escape(_date_to_iso(rec.get("aktualisiert")))
         begriffe = rec.get("gefundene_suchbegriffe") or []
         tags = "".join(f'<span class="tag">{html.escape(b)}</span>' for b in begriffe)
         stellentext_raw = rec.get("stellentext") or ""
@@ -533,9 +756,14 @@ def build_html_page(records: list[dict], map_filename: str | None = None) -> str
         meta_parts = [p for p in (ort, region, land) if p]
         meta_line = ", ".join(meta_parts)
 
-        cards.append(f"""
-        <article class="card" id="card_{job_id}" data-eg-klass="{eg_klass_attr}">
-            <h2><a href="{url}" target="_blank" rel="noopener">{title}</a></h2>
+        # Stellen, die im aktuellen Scan nicht mehr auftauchten (siehe
+        # _merge_job_store), werden ausgegraut, mit "Vergeben"-Badge markiert
+        # und eingeklappt dargestellt, statt einfach aus der Liste zu
+        # verschwinden.
+        verfuegbar = rec.get("_verfuegbar", True)
+        vergeben_badge = '<span class="vergeben-badge">🚫 Vergeben / nicht mehr verfügbar</span>' if not verfuegbar else ""
+
+        body_html = f"""
             <div class="meta">
                 {f'<span>📍 {meta_line}</span>' if meta_line else ''}
                 {f'<span>🏢 {unternehmen}</span>' if unternehmen else ''}
@@ -556,11 +784,28 @@ def build_html_page(records: list[dict], map_filename: str | None = None) -> str
             <details>
                 <summary>Stellenbeschreibung anzeigen</summary>
                 <div class="stellentext">{stellentext}</div>
-            </details>
+            </details>"""
+
+        if verfuegbar:
+            card_inner = body_html
+        else:
+            card_inner = f"""
+            <details>
+                <summary>Details anzeigen (eingeklappt, vermutlich vergeben)</summary>
+                {body_html}
+            </details>"""
+
+        cards.append(f"""
+        <article class="card{'' if verfuegbar else ' unavailable'}" id="card_{job_id}" data-eg-klass="{eg_klass_attr}" data-ort-city="{ort_city_attr}" data-aktualisiert="{aktualisiert_iso}" data-verfuegbar="{'1' if verfuegbar else '0'}">
+            <h2><a href="{url}" target="_blank" rel="noopener">{title}</a>{vergeben_badge}</h2>{card_inner}
         </article>""")
 
     cards_html = "\n".join(cards) if cards else '<p class="empty">Keine passenden Stellen gefunden.</p>'
     jobs_data_json = json.dumps(jobs_data, ensure_ascii=False).replace("</", "<\\/")
+
+    verfuegbar_count = sum(1 for rec in records if rec.get("_verfuegbar", True))
+    vergeben_count = len(records) - verfuegbar_count
+    ort_options = _collect_ort_options(records)
 
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -594,9 +839,27 @@ def build_html_page(records: list[dict], map_filename: str | None = None) -> str
         opacity: 0.6;
         border-left: 4px solid #2e7d32;
     }}
+    .card.unavailable {{
+        opacity: 0.55;
+        filter: grayscale(70%);
+        background: #ececec;
+        border-left: 4px solid #888;
+    }}
+    .card.unavailable h2 a {{ color: #555; }}
     .card h2 {{ margin: 0 0 8px 0; font-size: 1.15rem; }}
     .card h2 a {{ color: #005691; text-decoration: none; }}
     .card h2 a:hover {{ text-decoration: underline; }}
+    .vergeben-badge {{
+        display: inline-block;
+        background: #555;
+        color: #fff;
+        border-radius: 10px;
+        padding: 2px 8px;
+        font-size: 0.75rem;
+        font-weight: normal;
+        margin-left: 8px;
+        vertical-align: middle;
+    }}
     .meta {{
         display: flex;
         flex-wrap: wrap;
@@ -664,9 +927,9 @@ def build_html_page(records: list[dict], map_filename: str | None = None) -> str
 <body>
 <header>
     <h1>Bosch Stellensuche – Ergebnisse</h1>
-    <p>{len(records)} passende Stelle(n) &middot; erzeugt am {generated_at}{f' &middot; <a href="{html.escape(map_filename)}">🗺️ Karte anzeigen</a>' if map_filename else ''}</p>
+    <p>{verfuegbar_count} passende Stelle(n){f' &middot; {vergeben_count} davon nicht mehr verfügbar' if vergeben_count else ''} &middot; erzeugt am {generated_at}{f' &middot; <a href="{html.escape(map_filename)}">🗺️ Karte anzeigen</a>' if map_filename else ''}</p>
 </header>
-{_eg_filterbar_html()}
+{_eg_filterbar_html(ort_options)}
 <main>
 {cards_html}
 </main>
@@ -674,6 +937,7 @@ def build_html_page(records: list[dict], map_filename: str | None = None) -> str
 const JOBS_DATA = {jobs_data_json};
 {_STATUS_SCRIPT}
 {_eg_filter_script()}
+{_zeit_filter_script(previous_scan_at)}
 function sanitizeFilename(name) {{
     return name.replace(/[\\\\/:*?"<>|]/g, "_").trim() || "stellenanzeige";
 }}
@@ -745,14 +1009,18 @@ document.addEventListener("DOMContentLoaded", () => {{
     function applyFilters() {{
         const filterState = readEgFilterState();
         const statusFilterValue = document.getElementById("status-filter").value;
+        const ortFilterValue = document.getElementById("ort-filter").value;
+        const zeitFilterState = readZeitFilterState();
         let visible = 0;
         allCards.forEach((card) => {{
             const show = egRangMatches(card.dataset.egKlass, filterState)
-                && statusMatches(card.dataset.status, statusFilterValue);
+                && statusMatches(card.dataset.status, statusFilterValue)
+                && ortMatches(card.dataset.ortCity, ortFilterValue)
+                && zeitMatches(card.dataset.aktualisiert, zeitFilterState);
             card.style.display = show ? "" : "none";
             if (show) visible++;
         }});
-        countLabel.textContent = (filterState.filterActive || statusFilterValue !== "")
+        countLabel.textContent = (filterState.filterActive || statusFilterValue !== "" || ortFilterValue !== "" || zeitFilterState.active)
             ? `${{visible}} von ${{allCards.length}} Stellen passen zum Filter`
             : "";
     }}
@@ -777,6 +1045,7 @@ document.addEventListener("DOMContentLoaded", () => {{
     }});
 
     wireEgFilterControls(applyFilters);
+    wireZeitFilterControls(applyFilters);
 }});
 </script>
 </body>
@@ -807,7 +1076,12 @@ def _geocode_query_for_ort(ort: str) -> str:
     return ort
 
 
-def build_map_page(records: list[dict], geocode_cache: dict, proxy_server: str | None = None) -> str:
+def build_map_page(
+    records: list[dict],
+    geocode_cache: dict,
+    proxy_server: str | None = None,
+    previous_scan_at: str | None = None,
+) -> str:
     """Erzeugt eine eigenständige HTML-Seite mit einer Karte (Leaflet/OSM),
     auf der jede Stelle als Punkt an ihrem Standort eingeblendet wird.
 
@@ -841,10 +1115,16 @@ def build_map_page(records: list[dict], geocode_cache: dict, proxy_server: str |
             "title": rec.get("jobtitel") or "",
             "url": rec.get("url") or "#",
             "eg_klass": _parse_eg_label(rec.get("eg_einstufung")),
+            "ort_city": _extract_ort_cities(ort),
+            "aktualisiert": _date_to_iso(rec.get("aktualisiert")),
+            "verfuegbar": rec.get("_verfuegbar", True),
         })
 
     markers = list(points.values())
     markers_json = json.dumps(markers, ensure_ascii=False).replace("</", "<\\/")
+    verfuegbar_count = sum(1 for rec in records if rec.get("_verfuegbar", True))
+    vergeben_count = len(records) - verfuegbar_count
+    ort_options = _collect_ort_options(records)
 
     return f"""<!DOCTYPE html>
 <html lang="de">
@@ -877,7 +1157,18 @@ def build_map_page(records: list[dict], geocode_cache: dict, proxy_server: str |
     #map {{ flex: 1 1 auto; width: 100%; }}
     .popup-jobs {{ margin: 6px 0 0 0; padding-left: 18px; }}
     .popup-jobs li {{ margin-bottom: 8px; }}
+    .popup-jobs li.unavailable {{ opacity: 0.55; filter: grayscale(70%); }}
     .popup-jobs select {{ display: block; margin-top: 4px; padding: 2px 4px; font-size: 0.85rem; }}
+    .vergeben-badge {{
+        display: inline-block;
+        background: #555;
+        color: #fff;
+        border-radius: 10px;
+        padding: 1px 7px;
+        font-size: 0.72rem;
+        margin-left: 6px;
+        vertical-align: middle;
+    }}
     {_FILTERBAR_CSS}
     .filterbar {{ margin: 12px 24px 0; flex: none; }}
 </style>
@@ -885,17 +1176,19 @@ def build_map_page(records: list[dict], geocode_cache: dict, proxy_server: str |
 <body>
 <header>
     <h1>Bosch Stellensuche – Karte</h1>
-    <p>{len(markers)} Standort(e) &middot; {len(records)} passende Stelle(n)
+    <p>{len(markers)} Standort(e) &middot; {verfuegbar_count} passende Stelle(n)
+        {f' &middot; {vergeben_count} davon nicht mehr verfügbar' if vergeben_count else ''}
         {f' &middot; {missing} ohne ermittelbaren Standort' if missing else ''}
         &middot; erzeugt am {generated_at} &middot; <a href="javascript:history.back()">← Zurück zur Liste</a></p>
 </header>
-{_eg_filterbar_html()}
+{_eg_filterbar_html(ort_options)}
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const MARKERS = {markers_json};
 {_STATUS_SCRIPT}
 {_eg_filter_script()}
+{_zeit_filter_script(previous_scan_at)}
 function updateJobStatus(select) {{
     setJobStatus(select.dataset.id, select.value);
     renderMarkers();
@@ -923,7 +1216,9 @@ function jobsHtmlFor(jobs) {{
         const optionsHtml = STATUS_OPTIONS.map(([value, label]) =>
             `<option value="${{value}}"${{value === stored ? " selected" : ""}}>${{label}}</option>`
         ).join("");
-        return `<li><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a>
+        const unavailable = j.verfuegbar === false;
+        const badge = unavailable ? '<span class="vergeben-badge">🚫 Vergeben</span>' : "";
+        return `<li${{unavailable ? ' class="unavailable"' : ""}}><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a>${{badge}}
             <select data-id="${{j.id}}" onchange="updateJobStatus(this)">${{optionsHtml}}</select>
         </li>`;
     }}).join("");
@@ -932,12 +1227,16 @@ function jobsHtmlFor(jobs) {{
 function renderMarkers() {{
     const filterState = readEgFilterState();
     const statusFilterValue = document.getElementById("status-filter").value;
+    const ortFilterValue = document.getElementById("ort-filter").value;
+    const zeitFilterState = readZeitFilterState();
     markerLayer.clearLayers();
     let visibleMarkers = 0, visibleJobs = 0, totalJobs = 0;
     MARKERS.forEach((pt) => {{
         totalJobs += pt.jobs.length;
         const matching = pt.jobs.filter((j) =>
             egRangMatches(j.eg_klass, filterState) && statusMatches(getJobStatus(j.id), statusFilterValue)
+            && ortMatches(j.ort_city, ortFilterValue)
+            && zeitMatches(j.aktualisiert, zeitFilterState)
         );
         if (matching.length === 0) return;
         visibleMarkers++;
@@ -946,13 +1245,14 @@ function renderMarkers() {{
         const popupHtml = `<strong>${{safeOrt}}</strong><ul class="popup-jobs">${{jobsHtmlFor(matching)}}</ul>`;
         L.marker([pt.lat, pt.lon]).bindPopup(popupHtml).addTo(markerLayer);
     }});
-    countLabel.textContent = (filterState.filterActive || statusFilterValue !== "")
+    countLabel.textContent = (filterState.filterActive || statusFilterValue !== "" || ortFilterValue !== "" || zeitFilterState.active)
         ? `${{visibleJobs}} von ${{totalJobs}} Stellen an ${{visibleMarkers}} von ${{MARKERS.length}} Standort(en) passen zum Filter`
         : "";
 }}
 
 renderMarkers();
 wireEgFilterControls(renderMarkers);
+wireZeitFilterControls(renderMarkers);
 </script>
 </body>
 </html>
@@ -979,21 +1279,41 @@ def process_records(
         out_dir / map_output if map_output else out_dir / f"{base_path.stem}_karte.html"
     )
     cache_path = out_dir / "geocode_cache.json"
+    scan_state_path = out_dir / f"{base_path.stem}_scan_state.json"
+
+    # Zeitpunkt und Job-Store des VORHERIGEN Laufs für diese Eingabedatei -
+    # müssen vor dem Überschreiben der Scan-State-Datei ausgelesen werden.
+    scan_state = _load_scan_state(scan_state_path)
+    previous_scan_at = scan_state.get("last_scan_at")
+    current_scan_at = datetime.now().isoformat(timespec="seconds")
+
+    # Stellen, die im vorherigen Lauf noch da waren, jetzt aber aus dem Scan
+    # verschwunden sind, werden als "vergeben"/nicht mehr verfügbar
+    # weitergereicht (ausgegraut + eingeklappt in der Ansicht), statt einfach
+    # zu verschwinden - siehe _merge_job_store.
+    all_records, job_store = _merge_job_store(records, scan_state.get("jobs", {}), current_scan_at)
 
     map_filename = None
     if not no_map:
         print("\nErmittle Standorte für die Kartenansicht (Geocoding via OpenStreetMap)...")
         geocode_cache = load_geocode_cache(cache_path)
         try:
-            map_html = build_map_page(records, geocode_cache, proxy_server=proxy_server)
+            map_html = build_map_page(
+                all_records, geocode_cache, proxy_server=proxy_server, previous_scan_at=previous_scan_at
+            )
         finally:
             save_geocode_cache(geocode_cache, cache_path)
         map_output_path.write_text(map_html, encoding="utf-8")
         print(f"Kartenansicht gespeichert in: {map_output_path}")
         map_filename = map_output_path.name
 
-    html_output_path.write_text(build_html_page(records, map_filename=map_filename), encoding="utf-8")
+    html_output_path.write_text(
+        build_html_page(all_records, map_filename=map_filename, previous_scan_at=previous_scan_at),
+        encoding="utf-8",
+    )
     print(f"HTML-Übersicht gespeichert in: {html_output_path}")
+
+    _save_scan_state(scan_state_path, {"last_scan_at": current_scan_at, "jobs": job_store})
 
 
 def main() -> None:
