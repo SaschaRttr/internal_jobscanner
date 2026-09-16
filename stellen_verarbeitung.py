@@ -871,8 +871,8 @@ def build_html_page(
                 {f'<span>📍 {meta_line}</span>' if meta_line else ''}
                 {f'<span>🏢 {unternehmen}</span>' if unternehmen else ''}
                 {f'<span>💼 {anstellungsart}</span>' if anstellungsart else ''}
-                {f'<span>� Referenz: {referenznummer}</span>' if referenznummer else ''}
-                {f'<span>�🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
+                {f'<span>🔖 Referenz: {referenznummer}</span>' if referenznummer else ''}
+                {f'<span>🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
                 {f'<span>🔎 Gefunden am: {gefunden}</span>' if gefunden else ''}
             </div>
             <div class="tags">{eg_tag}{tags}</div>
