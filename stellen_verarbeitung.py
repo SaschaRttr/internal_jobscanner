@@ -187,6 +187,16 @@ def _date_to_iso(value) -> str:
     return ""
 
 
+def _format_scan_timestamp(iso_ts: str | None) -> str:
+    """Formatiert einen Scan-Zeitstempel (datetime.isoformat()) zu DD.MM.YYYY HH:MM."""
+    if not iso_ts:
+        return ""
+    try:
+        return datetime.fromisoformat(iso_ts).strftime("%d.%m.%Y %H:%M")
+    except (ValueError, TypeError):
+        return iso_ts
+
+
 def _load_scan_state(path: Path) -> dict:
     """Lädt den Zustand des vorherigen Laufs für diese Eingabedatei (Zeitpunkt
     für den Zeitraum-Filter "Neu seit letztem Scan" + Job-Store für den
@@ -243,9 +253,11 @@ def _merge_job_store(
     for idx, rec in enumerate(current_records):
         job_id = _job_id(rec, idx)
         current_ids.add(job_id)
-        new_store[job_id] = {"record": rec, "zuletzt_gesehen": current_scan_at}
+        zuerst_gefunden = (previous_jobs.get(job_id) or {}).get("zuerst_gefunden") or current_scan_at
+        new_store[job_id] = {"record": rec, "zuletzt_gesehen": current_scan_at, "zuerst_gefunden": zuerst_gefunden}
         merged = dict(rec)
         merged["_verfuegbar"] = True
+        merged["_zuerst_gefunden"] = zuerst_gefunden
         all_records.append(merged)
 
     for job_id, entry in previous_jobs.items():
@@ -258,9 +270,12 @@ def _merge_job_store(
             "record": entry.get("record", {}),
             "zuletzt_gesehen": entry.get("zuletzt_gesehen"),
             "seit_wann_nicht_verfuegbar": seit_wann_weg,
+            "zuerst_gefunden": entry.get("zuerst_gefunden"),
         }
         merged = dict(entry.get("record", {}))
         merged["_verfuegbar"] = False
+        merged["_seit_wann_nicht_verfuegbar"] = seit_wann_weg
+        merged["_zuerst_gefunden"] = entry.get("zuerst_gefunden")
         all_records.append(merged)
 
     return all_records, new_store
@@ -476,6 +491,13 @@ def _eg_filterbar_html(ort_options: list[str] | None = None) -> str:
             {ort_filter_options}
         </select>
     </label>
+    <label>Verfügbarkeit
+        <select id="verfuegbarkeit-filter">
+            <option value="">Alle</option>
+            <option value="verfuegbar">Nur verfügbare</option>
+            <option value="vergeben">Nur vergebene</option>
+        </select>
+    </label>
     <label>Zeitraum
         <select id="zeit-filter">
             <option value="">Alle</option>
@@ -628,6 +650,12 @@ function ortMatches(rawOrtCities, filterValue) {{
     return parseOrtCities(rawOrtCities).includes(filterValue);
 }}
 
+function verfuegbarkeitMatches(verfuegbar, filterValue) {{
+    if (!filterValue) return true;
+    if (filterValue === "vergeben") return verfuegbar === false;
+    return verfuegbar !== false;
+}}
+
 function wireEgFilterControls(onChange) {{
     const levelSelect = document.getElementById("eg-level");
     levelSelect.addEventListener("change", () => {{
@@ -638,12 +666,14 @@ function wireEgFilterControls(onChange) {{
     document.getElementById("eg-level-2").addEventListener("change", onChange);
     document.getElementById("status-filter").addEventListener("change", onChange);
     document.getElementById("ort-filter").addEventListener("change", onChange);
+    document.getElementById("verfuegbarkeit-filter").addEventListener("change", onChange);
     document.getElementById("eg-reset").addEventListener("click", () => {{
         levelSelect.value = "";
         populateLevel2Options();
         document.getElementById("eg-operator").value = "=";
         document.getElementById("status-filter").value = "";
         document.getElementById("ort-filter").value = "";
+        document.getElementById("verfuegbarkeit-filter").value = "";
         document.getElementById("zeit-filter").value = "";
         document.getElementById("zeit-anzahl").value = "7";
         readZeitFilterState();
@@ -734,6 +764,7 @@ def build_html_page(
         unternehmen = html.escape(rec.get("unternehmen") or "")
         aktualisiert = html.escape(_format_date(rec.get("aktualisiert")))
         aktualisiert_iso = html.escape(_date_to_iso(rec.get("aktualisiert")))
+        gefunden = html.escape(_format_scan_timestamp(rec.get("_zuerst_gefunden")))
         begriffe = rec.get("gefundene_suchbegriffe") or []
         tags = "".join(f'<span class="tag">{html.escape(b)}</span>' for b in begriffe)
         stellentext_raw = rec.get("stellentext") or ""
@@ -761,7 +792,12 @@ def build_html_page(
         # und eingeklappt dargestellt, statt einfach aus der Liste zu
         # verschwinden.
         verfuegbar = rec.get("_verfuegbar", True)
-        vergeben_badge = '<span class="vergeben-badge">🚫 Vergeben / nicht mehr verfügbar</span>' if not verfuegbar else ""
+        vergeben_seit = html.escape(_format_scan_timestamp(rec.get("_seit_wann_nicht_verfuegbar"))) if not verfuegbar else ""
+        vergeben_badge = (
+            f'<span class="vergeben-badge">🚫 Vergeben / nicht mehr verfügbar{f" (seit {vergeben_seit})" if vergeben_seit else ""}</span>'
+            if not verfuegbar
+            else ""
+        )
 
         body_html = f"""
             <div class="meta">
@@ -769,6 +805,7 @@ def build_html_page(
                 {f'<span>🏢 {unternehmen}</span>' if unternehmen else ''}
                 {f'<span>💼 {anstellungsart}</span>' if anstellungsart else ''}
                 {f'<span>🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
+                {f'<span>🔎 Gefunden am: {gefunden}</span>' if gefunden else ''}
             </div>
             <div class="tags">{eg_tag}{tags}</div>
             <div class="actions">
@@ -1010,17 +1047,19 @@ document.addEventListener("DOMContentLoaded", () => {{
         const filterState = readEgFilterState();
         const statusFilterValue = document.getElementById("status-filter").value;
         const ortFilterValue = document.getElementById("ort-filter").value;
+        const verfuegbarkeitFilterValue = document.getElementById("verfuegbarkeit-filter").value;
         const zeitFilterState = readZeitFilterState();
         let visible = 0;
         allCards.forEach((card) => {{
             const show = egRangMatches(card.dataset.egKlass, filterState)
                 && statusMatches(card.dataset.status, statusFilterValue)
                 && ortMatches(card.dataset.ortCity, ortFilterValue)
+                && verfuegbarkeitMatches(card.dataset.verfuegbar === "1", verfuegbarkeitFilterValue)
                 && zeitMatches(card.dataset.aktualisiert, zeitFilterState);
             card.style.display = show ? "" : "none";
             if (show) visible++;
         }});
-        countLabel.textContent = (filterState.filterActive || statusFilterValue !== "" || ortFilterValue !== "" || zeitFilterState.active)
+        countLabel.textContent = (filterState.filterActive || statusFilterValue !== "" || ortFilterValue !== "" || verfuegbarkeitFilterValue !== "" || zeitFilterState.active)
             ? `${{visible}} von ${{allCards.length}} Stellen passen zum Filter`
             : "";
     }}
@@ -1117,7 +1156,9 @@ def build_map_page(
             "eg_klass": _parse_eg_label(rec.get("eg_einstufung")),
             "ort_city": _extract_ort_cities(ort),
             "aktualisiert": _date_to_iso(rec.get("aktualisiert")),
+            "gefunden": _format_scan_timestamp(rec.get("_zuerst_gefunden")),
             "verfuegbar": rec.get("_verfuegbar", True),
+            "seit_wann_nicht_verfuegbar": _format_scan_timestamp(rec.get("_seit_wann_nicht_verfuegbar")) if not rec.get("_verfuegbar", True) else "",
         })
 
     markers = list(points.values())
@@ -1217,8 +1258,9 @@ function jobsHtmlFor(jobs) {{
             `<option value="${{value}}"${{value === stored ? " selected" : ""}}>${{label}}</option>`
         ).join("");
         const unavailable = j.verfuegbar === false;
-        const badge = unavailable ? '<span class="vergeben-badge">🚫 Vergeben</span>' : "";
-        return `<li${{unavailable ? ' class="unavailable"' : ""}}><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a>${{badge}}
+        const badge = unavailable ? `<span class="vergeben-badge">🚫 Vergeben${{j.seit_wann_nicht_verfuegbar ? " (seit " + j.seit_wann_nicht_verfuegbar + ")" : ""}}</span>` : "";
+        const gefundenLine = j.gefunden ? `<br><small>🔎 Gefunden am: ${{j.gefunden}}</small>` : "";
+        return `<li${{unavailable ? ' class="unavailable"' : ""}}><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a>${{badge}}${{gefundenLine}}
             <select data-id="${{j.id}}" onchange="updateJobStatus(this)">${{optionsHtml}}</select>
         </li>`;
     }}).join("");
@@ -1228,6 +1270,7 @@ function renderMarkers() {{
     const filterState = readEgFilterState();
     const statusFilterValue = document.getElementById("status-filter").value;
     const ortFilterValue = document.getElementById("ort-filter").value;
+    const verfuegbarkeitFilterValue = document.getElementById("verfuegbarkeit-filter").value;
     const zeitFilterState = readZeitFilterState();
     markerLayer.clearLayers();
     let visibleMarkers = 0, visibleJobs = 0, totalJobs = 0;
@@ -1236,6 +1279,7 @@ function renderMarkers() {{
         const matching = pt.jobs.filter((j) =>
             egRangMatches(j.eg_klass, filterState) && statusMatches(getJobStatus(j.id), statusFilterValue)
             && ortMatches(j.ort_city, ortFilterValue)
+            && verfuegbarkeitMatches(j.verfuegbar, verfuegbarkeitFilterValue)
             && zeitMatches(j.aktualisiert, zeitFilterState)
         );
         if (matching.length === 0) return;
@@ -1245,7 +1289,7 @@ function renderMarkers() {{
         const popupHtml = `<strong>${{safeOrt}}</strong><ul class="popup-jobs">${{jobsHtmlFor(matching)}}</ul>`;
         L.marker([pt.lat, pt.lon]).bindPopup(popupHtml).addTo(markerLayer);
     }});
-    countLabel.textContent = (filterState.filterActive || statusFilterValue !== "" || ortFilterValue !== "" || zeitFilterState.active)
+    countLabel.textContent = (filterState.filterActive || statusFilterValue !== "" || ortFilterValue !== "" || verfuegbarkeitFilterValue !== "" || zeitFilterState.active)
         ? `${{visibleJobs}} von ${{totalJobs}} Stellen an ${{visibleMarkers}} von ${{MARKERS.length}} Standort(en) passen zum Filter`
         : "";
 }}

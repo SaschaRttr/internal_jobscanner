@@ -22,6 +22,7 @@ $python = "C:\Program Files\Miniforge\python.exe"
     --console `
     --name Stellensuche `
     --collect-all playwright `
+    --noupx `
     --clean `
     --noconfirm `
     stellensuche.py
@@ -30,3 +31,9 @@ Write-Host ""
 Write-Host "Fertig. dist\Stellensuche\ enthaelt Stellensuche.exe + benoetigte DLLs/Dateien."
 Write-Host "Bitte den kompletten Ordner 'dist\Stellensuche' weitergeben (nicht nur die exe)."
 Write-Host "Bitte config.txt zusaetzlich in den Ordner 'dist\Stellensuche' kopieren."
+Write-Host ""
+Write-Host "Falls auf dem Zielrechner eine Sicherheitswarnung (SmartScreen/AppLocker/Antivirus)"
+Write-Host "erscheint: Ordner nach dem Kopieren auf dem Zielrechner entsperren mit:"
+Write-Host "  Get-ChildItem -Path 'dist\Stellensuche' -Recurse | Unblock-File"
+Write-Host "Eine dauerhafte Loesung erfordert eine Code-Signatur (internes Bosch-Zertifikat)"
+Write-Host "oder eine AppLocker/Defender-Ausnahme durch die IT."
