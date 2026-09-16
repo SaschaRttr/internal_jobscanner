@@ -38,39 +38,101 @@ FALLBACK_PROXY = "http://rb-proxy-de.bosch.com:8080"
 PAC_URL = "http://rbins.bosch.com/fe.pac"
 
 
+def _proxy_url_with_credentials(proxy_url: str) -> str:
+    """Ergänzt eine Proxy-URL um Basic-Auth-Zugangsdaten, falls hinterlegt.
+
+    Manche Firmenproxies (Fehler "407 Proxy authentication required") verlangen
+    Zugangsdaten, die die Windows-/Browser-Anmeldung automatisch mitschickt,
+    ein einfacher urllib-Request aber nicht. Sind die Umgebungsvariablen
+    STELLENSUCHE_PROXY_USER/STELLENSUCHE_PROXY_PASSWORD gesetzt, werden sie als
+    user:pass@ in die Proxy-URL eingebettet - urllib schickt dafür automatisch
+    einen "Proxy-Authorization: Basic ..."-Header mit (funktioniert nur bei
+    Basic-Auth-Proxies, nicht bei NTLM/Kerberos).
+    """
+    import os
+
+    user = os.environ.get("STELLENSUCHE_PROXY_USER")
+    password = os.environ.get("STELLENSUCHE_PROXY_PASSWORD")
+    if not user or not password or "@" in proxy_url:
+        return proxy_url
+    scheme, _, rest = proxy_url.partition("://")
+    return f"{scheme}://{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}@{rest}"
+
+
 def detect_proxy() -> str | None:
     """Ermittelt den zu verwendenden Proxy-Server (Env-Variable > PAC-Datei > Fallback).
 
     Wird fürs Geocoding (Nominatim) gebraucht, falls das Firmennetz einen
-    Proxy verlangt. Identisch zur Logik in stellensuche.py.
+    Proxy verlangt. Identisch zur Logik in stellensuche.py, ergänzt Basic-Auth-
+    Zugangsdaten (siehe _proxy_url_with_credentials) falls hinterlegt.
     """
     import os
 
+    proxy = None
     for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
         if os.environ.get(var):
-            return os.environ[var]
+            proxy = os.environ[var]
+            break
 
+    if proxy is None:
+        try:
+            with urllib.request.urlopen(PAC_URL, timeout=5) as resp:
+                pac_text = resp.read().decode("utf-8", errors="ignore")
+            match = re.search(r'Pri_Proxy\s*=\s*"([^"]+)"', pac_text)
+            if match:
+                proxy = f"http://{match.group(1)}"
+        except Exception:
+            pass
+
+    if proxy is None:
+        proxy = FALLBACK_PROXY
+
+    return _proxy_url_with_credentials(proxy)
+
+
+def _fetch_via_winhttp(url: str, proxy_server: str | None, timeout_ms: int = 10000) -> bytes | None:
+    """Ruft eine URL über die Windows-eigene WinHTTP-Komponente ab.
+
+    WinHTTP kennt den Firmenproxy standardmäßig NICHT (siehe
+    "netsh winhttp show proxy" -> "Direct access") und muss ihn deshalb
+    explizit gesetzt bekommen (proxy_server aus detect_proxy()). Bei
+    "407 Proxy authentication required" authentifiziert sich WinHTTP dann
+    aber transparent mit den aktuell angemeldeten Windows-Zugangsdaten
+    (NTLM/Kerberos-SSO) - ganz ohne Passworteingabe, so wie auch der
+    Chromium-Login im Bosch-Portal ohne manuelle Proxy-Anmeldung läuft.
+    Eingebettete Basic-Auth-Zugangsdaten in proxy_server (siehe
+    _proxy_url_with_credentials) werden hier nicht gebraucht und entfernt.
+    Braucht pywin32 (win32com.client); liefert None, wenn das fehlt oder der
+    Request fehlschlägt - dann greift der urllib-Fallback in geocode_address().
+    """
     try:
-        with urllib.request.urlopen(PAC_URL, timeout=5) as resp:
-            pac_text = resp.read().decode("utf-8", errors="ignore")
-        match = re.search(r'Pri_Proxy\s*=\s*"([^"]+)"', pac_text)
-        if match:
-            return f"http://{match.group(1)}"
+        import win32com.client
+    except ImportError:
+        return None
+    try:
+        http = win32com.client.Dispatch("WinHttp.WinHttpRequest.5.1")
+        http.SetTimeouts(timeout_ms, timeout_ms, timeout_ms, timeout_ms)
+        if proxy_server:
+            _, _, host_and_port = proxy_server.rpartition("@")
+            host_and_port = host_and_port.split("://", 1)[-1]
+            http.SetProxy(2, host_and_port, "<local>")
+        http.Open("GET", url, False)
+        http.SetRequestHeader("User-Agent", "Stellensuche-intern/1.0 (internes Tool)")
+        http.Send()
+        return bytes(http.ResponseBody)
     except Exception:
-        pass
-
-    return FALLBACK_PROXY
+        return None
 
 
 # --- TEMPORÄRER Workaround (siehe TODO.md, Punkt "Geocoding schlägt außerhalb
 # des Bosch-Netzes fehl") ------------------------------------------------
-# detect_proxy() liefert außerhalb des Bosch-Netzes/VPN trotzdem den fest
-# hinterlegten Firmenproxy zurück, der dort per DNS nicht auflösbar ist
-# (getaddrinfo failed). Dieser Helper versucht deshalb zuerst OHNE Proxy und
-# fällt erst bei einem Fehler auf `proxy_server` zurück - funktioniert so
-# sowohl im Firmennetz als auch ohne Proxy/VPN. Kann komplett entfernt werden
-# (Aufruf in geocode_address() durch ein einfaches urlopen()/opener.open()
-# ersetzen), sobald detect_proxy() das sauberer selbst erkennt.
+# Nur noch Fallback, falls _fetch_via_winhttp() nicht verfügbar ist/fehlschlägt
+# (z. B. kein pywin32, oder Nicht-Windows). detect_proxy() liefert außerhalb
+# des Bosch-Netzes/VPN trotzdem den fest hinterlegten Firmenproxy zurück, der
+# dort per DNS nicht auflösbar ist (getaddrinfo failed). Dieser Helper
+# versucht deshalb zuerst OHNE Proxy und fällt erst bei einem Fehler auf
+# `proxy_server` zurück - funktioniert so sowohl im Firmennetz als auch ohne
+# Proxy/VPN.
 def _open_with_proxy_fallback(request: urllib.request.Request, proxy_server: str | None):
     try:
         return urllib.request.urlopen(request, timeout=3)
@@ -120,13 +182,17 @@ def geocode_address(address: str, cache: dict, proxy_server: str | None = None) 
         return (value[0], value[1]) if value else None
 
     query = urllib.parse.urlencode({"format": "json", "q": address, "limit": 1})
-    request = urllib.request.Request(
-        f"{NOMINATIM_URL}?{query}",
-        headers={"User-Agent": "Stellensuche-intern/1.0 (internes Tool)"},
-    )
+    url = f"{NOMINATIM_URL}?{query}"
     try:
-        with _open_with_proxy_fallback(request, proxy_server) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        raw = _fetch_via_winhttp(url, proxy_server)
+        if raw is not None:
+            data = json.loads(raw.decode("utf-8"))
+        else:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "Stellensuche-intern/1.0 (internes Tool)"},
+            )
+            with _open_with_proxy_fallback(request, proxy_server) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         # Netzwerk-/Proxy-Fehler oder eine kaputte Antwort bedeuten nicht, dass die
         # Adresse nicht existiert - hier NICHT cachen, sonst "vergiftet" ein
@@ -762,6 +828,7 @@ def build_html_page(
         land = html.escape(rec.get("land") or "")
         anstellungsart = html.escape(rec.get("anstellungsart") or "")
         unternehmen = html.escape(rec.get("unternehmen") or "")
+        referenznummer = html.escape(rec.get("referenznummer") or "")
         aktualisiert = html.escape(_format_date(rec.get("aktualisiert")))
         aktualisiert_iso = html.escape(_date_to_iso(rec.get("aktualisiert")))
         gefunden = html.escape(_format_scan_timestamp(rec.get("_zuerst_gefunden")))
@@ -804,7 +871,8 @@ def build_html_page(
                 {f'<span>📍 {meta_line}</span>' if meta_line else ''}
                 {f'<span>🏢 {unternehmen}</span>' if unternehmen else ''}
                 {f'<span>💼 {anstellungsart}</span>' if anstellungsart else ''}
-                {f'<span>🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
+                {f'<span>� Referenz: {referenznummer}</span>' if referenznummer else ''}
+                {f'<span>�🕒 Aktualisiert: {aktualisiert}</span>' if aktualisiert else ''}
                 {f'<span>🔎 Gefunden am: {gefunden}</span>' if gefunden else ''}
             </div>
             <div class="tags">{eg_tag}{tags}</div>

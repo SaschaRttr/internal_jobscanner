@@ -632,10 +632,14 @@ def main() -> None:
 
     # HTML-/Kartenansicht übernimmt stellen_verarbeitung.py (separat testbar
     # gegen jede bereits vorhandene JSON-Datei, ganz ohne Playwright/Login).
+    # Eigener detect_proxy()-Aufruf (statt des oben für Playwright ermittelten
+    # proxy_server), damit fürs Geocoding auch per STELLENSUCHE_PROXY_USER/
+    # STELLENSUCHE_PROXY_PASSWORD hinterlegte Zugangsdaten greifen (siehe
+    # stellen_verarbeitung._proxy_url_with_credentials).
     stellen_verarbeitung.process_records(
         records, output_path,
         html_output=args.html_output, map_output=args.map_output,
-        no_map=args.no_map, proxy_server=proxy_server,
+        no_map=args.no_map, proxy_server=None if args.no_map else stellen_verarbeitung.detect_proxy(),
     )
 
 
