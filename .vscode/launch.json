@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Stellensuche starten",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/stellensuche.py",
+            "python": "C:/Program Files/Miniforge3/python.exe",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/packages"
+            }
+        }
+    ]
+}

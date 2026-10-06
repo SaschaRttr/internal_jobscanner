@@ -30,3 +30,37 @@ Ablauf:
 Tipp: Man kann sich diesen Befehl auch als kleine .ps1-Datei ablegen, z. B.
 "start_suche.ps1" mit obigem Inhalt, und dann per Rechtsklick "Mit PowerShell
 ausführen" starten, ohne den Befehl jedes Mal neu abzutippen.
+
+
+Ersteinrichtung: Abhängigkeiten installieren (ohne venv)
+====================================================================
+
+Hinweis: Ein "normales" venv (python -m venv) legt eine EIGENE, kopierte
+python.exe in .venv\Scripts an. Auf manchen Firmenrechnern blockiert die
+Gruppenrichtlinie genau das (Fehler "WinError 1260 ... wird durch
+Gruppenrichtlinien blockiert"), egal wo diese kopierte python.exe liegt –
+nur die originale Miniforge-python.exe ist erlaubt. Deshalb installieren wir
+die Pakete stattdessen in einen einfachen Unterordner ("packages"), ohne
+eine zweite python.exe zu erzeugen. Gestartet wird weiterhin ausschließlich
+mit der originalen, erlaubten Miniforge-python.exe.
+
+Diese Schritte sind nur einmalig nötig, z. B. auf einem neuen Rechner, auf
+dem bisher nur Miniforge installiert ist. Alle Befehle im Ordner
+Stellensuche_intern ausführen (PowerShell):
+
+1. Abhängigkeiten aus requirements.txt in den Ordner "packages" installieren
+   (erzeugt KEINE eigene python.exe, nur Paket-Dateien):
+   & "C:\Program Files\Miniforge3\python.exe" -m pip install --target packages -r requirements.txt
+
+2. Playwright-Browser (Chromium) herunterladen, wird von playwright benötigt:
+   & "C:\Program Files\Miniforge3\python.exe" -m playwright install chromium
+
+Das war's. start.bat erkennt automatisch, dass der Ordner "packages"
+vorhanden ist, und setzt PYTHONPATH entsprechend, bevor die originale
+Miniforge-python.exe gestartet wird – kein Aktivieren nötig, einfach
+start.bat per Doppelklick starten.
+
+Nur falls die Suche stattdessen per PowerShell-Befehl (siehe oben) gestartet
+werden soll, muss vorher einmalig PYTHONPATH gesetzt werden, damit die
+Pakete aus "packages" gefunden werden:
+   $env:PYTHONPATH = "$PWD\packages"

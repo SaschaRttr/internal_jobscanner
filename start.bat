@@ -1,4 +1,7 @@
 @echo off
 cd /d "%~dp0"
-"C:\Program Files\Miniforge\python.exe" stellensuche.py
+if exist "packages" (
+    set PYTHONPATH=%~dp0packages
+)
+"C:\Program Files\Miniforge3\python.exe" stellensuche.py
 pause

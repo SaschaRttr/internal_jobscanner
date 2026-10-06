@@ -1,0 +1,53 @@
+Chromium manuell installieren (wenn der automatische Download nicht klappt)
+============================================================================
+
+Du hast das Chromium-ZIP bereits manuell heruntergeladen. Damit Playwright
+diese Installation erkennt und nutzt, muss sie an einem exakt bestimmten
+Ort liegen.
+
+SCHRITT 1: Erwarteten Ordnernamen/Version herausfinden (offline, kein Download)
+--------------------------------------------------------------------------
+In PowerShell im Projektordner ausfuehren:
+
+    $env:PYTHONPATH = "$PWD\packages"
+    & "C:\Program Files\Miniforge3\python.exe" -m playwright install chromium --dry-run
+
+Die Ausgabe zeigt eine Zeile wie:
+
+    Install location:    C:\Users\<name>\AppData\Local\ms-playwright\chromium-1148
+
+Merke dir diesen kompletten Pfad und die Versionsnummer (hier: 1148).
+
+
+SCHRITT 2: ZIP an den richtigen Ort entpacken
+--------------------------------------------------------------------------
+Entpacke dein heruntergeladenes ZIP so, dass am Ende genau diese Struktur
+entsteht:
+
+    %LOCALAPPDATA%\ms-playwright\chromium-1148\chrome-win\chrome.exe
+
+Das heisst: der Unterordner "chrome-win" (mit chrome.exe darin) muss
+direkt in "chromium-1148" liegen. "1148" durch die Versionsnummer aus
+Schritt 1 ersetzen.
+
+
+SCHRITT 3: Marker-Datei anlegen (WICHTIG!)
+--------------------------------------------------------------------------
+Ohne diese Datei denkt Playwright, die Installation sei unvollstaendig,
+und versucht bei jedem Start erneut zu laden. In PowerShell:
+
+    New-Item "$env:LOCALAPPDATA\ms-playwright\chromium-1148\INSTALLATION_COMPLETE" -ItemType File
+
+("1148" wieder durch die richtige Versionsnummer ersetzen.)
+
+
+SCHRITT 4: Testen
+--------------------------------------------------------------------------
+Einfach stellensuche.py bzw. start.bat starten. Wenn chrome.exe am
+richtigen Ort liegt und die Marker-Datei existiert, ueberspringt Playwright
+den Download komplett und startet direkt.
+
+
+Falls es weiterhin nicht funktioniert: die genaue Ausgabe von Schritt 1
+(Versionsnummer) und den Inhalt/Ordnerstruktur des entpackten ZIPs notieren
+und zur Fehlersuche bereithalten.

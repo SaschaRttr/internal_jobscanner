@@ -21,9 +21,11 @@ Das Erzeugen der JSON-Datei selbst übernimmt weiterhin `stellensuche.py`
 """
 
 import argparse
+import difflib
 import html
 import json
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -280,6 +282,21 @@ def _save_scan_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _load_status_map(path: Path) -> dict:
+    """Lädt zuvor per "💾 Status-Übersicht speichern"-Button exportierte
+    Bewerbungsstatus-Werte (Format {job_id: status}), damit sie beim
+    nächsten Erzeugen des Berichts wieder in Listen-/Kartenansicht
+    vorausgefüllt werden, statt nur im (ggf. verlorenen) Browser-localStorage
+    zu existieren. Gibt {} zurück, wenn noch nichts exportiert wurde."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 # Wie viele Tage eine verschwundene Stelle noch (ausgegraut/eingeklappt) in der
 # Ansicht auftaucht, bevor sie endgültig aus dem Job-Store entfernt wird -
 # ansonsten würde der Store (und damit die _scan_state.json) unbegrenzt wachsen.
@@ -295,8 +312,28 @@ def _days_since(iso_ts: str | None, now_iso: str) -> float:
         return 0.0
 
 
+def _still_matches_filters(rec: dict, terms: list[str] | None, blacklist: list[str] | None) -> bool:
+    """Prüft, ob ein gespeicherter Datensatz noch zu den AKTUELLEN Such-/
+    Ausschlussbegriffen passt (gleiche Logik wie stellensuche.filter_matching_jobs).
+
+    Ist `terms` None, wurden keine Begriffe übergeben (z. B. beim eigenständigen
+    Aufruf von stellen_verarbeitung.py ohne config.txt) - dann wird nichts
+    herausgefiltert, um das bisherige Verhalten nicht zu ändern.
+    """
+    if terms is None:
+        return True
+    name_lower = (rec.get("jobtitel") or "").lower()
+    if any(b.lower() in name_lower for b in (blacklist or [])):
+        return False
+    return any(t.lower() in name_lower for t in terms)
+
+
 def _merge_job_store(
-    current_records: list[dict], previous_jobs: dict, current_scan_at: str
+    current_records: list[dict],
+    previous_jobs: dict,
+    current_scan_at: str,
+    terms: list[str] | None = None,
+    blacklist: list[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """Reichert die aktuell gescrapten Stellen um solche an, die im letzten
     Lauf noch da waren, jetzt aber aus dem Scan verschwunden sind (= vermutlich
@@ -308,9 +345,27 @@ def _merge_job_store(
     anzeigen können. Nach UNAVAILABLE_RETENTION_DAYS werden sie endgültig aus
     dem zurückgegebenen Store entfernt.
 
+    Werden `terms`/`blacklist` übergeben, wird eine verschwundene Stelle nur
+    dann weiterhin angezeigt, wenn ihr Titel auch nach den AKTUELLEN
+    Suchbegriffen noch passen würde - sonst wird sie sofort aus dem Store
+    entfernt. Ohne das würde eine Stelle, die durch eine Änderung der
+    Suchbegriffe in config.txt herausfallen soll, trotzdem noch bis zu
+    UNAVAILABLE_RETENTION_DAYS lang (ausgegraut) angezeigt.
+
     Gibt (alle_records, neuer_job_store) zurück; alle_records enthält zuerst
     die aktuell verfügbaren, danach die (noch nicht abgelaufenen) nicht mehr
     verfügbaren Stellen.
+
+    Jeder Record bekommt zusätzlich das (nicht mit "_" präfixte) Feld
+    "gefunden_am" - dieselbe Information wie "_zuerst_gefunden", aber OHNE
+    führenden Unterstrich, damit sie beim Zurückschreiben nach
+    bosch_jobs_gefiltert.json (siehe process_records) als normales Feld
+    erhalten bleibt und nicht vom nächsten Scan überschrieben wird. Zusätzlich
+    wird erkannt, ob sich das von Bosch gelieferte "aktualisiert"-Datum seit
+    dem erstmaligen Fund geändert hat (_wurde_aktualisiert), damit die
+    HTML-/Kartenansicht echte inhaltliche Aktualisierungen separat markieren
+    kann statt nur den (sich bei jedem Bosch-internen Re-Save ändernden)
+    Rohwert anzuzeigen.
     """
     new_store: dict[str, dict] = {}
     all_records: list[dict] = []
@@ -319,15 +374,60 @@ def _merge_job_store(
     for idx, rec in enumerate(current_records):
         job_id = _job_id(rec, idx)
         current_ids.add(job_id)
-        zuerst_gefunden = (previous_jobs.get(job_id) or {}).get("zuerst_gefunden") or current_scan_at
-        new_store[job_id] = {"record": rec, "zuletzt_gesehen": current_scan_at, "zuerst_gefunden": zuerst_gefunden}
+        previous_entry = previous_jobs.get(job_id) or {}
+        zuerst_gefunden = previous_entry.get("zuerst_gefunden") or current_scan_at
+        aktualisiert_iso = _date_to_iso(rec.get("aktualisiert"))
+        erstgefunden_aktualisiert = previous_entry.get("erstgefunden_aktualisiert")
+        if erstgefunden_aktualisiert is None:
+            erstgefunden_aktualisiert = aktualisiert_iso
+        wurde_aktualisiert = bool(erstgefunden_aktualisiert) and aktualisiert_iso != erstgefunden_aktualisiert
+
+        # Änderungen gegenüber dem letzten Scan erkennen und als Verlauf
+        # mitführen (alter + neuer Stellentext/Jobtitel inkl. Zeitpunkt),
+        # damit die Ansicht ein Delta anzeigen kann statt die alten Werte
+        # einfach zu verlieren. Nur protokollieren, wenn schon ein vorheriger
+        # Wert bekannt war (sonst würde der allererste Fund als "Änderung"
+        # gelten). Titeländerungen kommen bei Bosch gelegentlich vor (z. B.
+        # EG-Umstufung im Titel), Stellentext deutlich häufiger.
+        aenderungen = list(previous_entry.get("aenderungen") or [])
+        previous_record = previous_entry.get("record") or {}
+        previous_text = previous_record.get("stellentext")
+        current_text = rec.get("stellentext")
+        previous_titel = previous_record.get("jobtitel")
+        current_titel = rec.get("jobtitel")
+        text_geaendert = bool(previous_text and current_text and previous_text != current_text)
+        titel_geaendert = bool(previous_titel and current_titel and previous_titel != current_titel)
+        if text_geaendert or titel_geaendert:
+            aenderungen.append(
+                {
+                    "zeitpunkt": current_scan_at,
+                    "alter_text": previous_text if text_geaendert else "",
+                    "neuer_text": current_text if text_geaendert else "",
+                    "alter_titel": previous_titel if titel_geaendert else "",
+                    "neuer_titel": current_titel if titel_geaendert else "",
+                }
+            )
+
+        new_store[job_id] = {
+            "record": rec,
+            "zuletzt_gesehen": current_scan_at,
+            "zuerst_gefunden": zuerst_gefunden,
+            "erstgefunden_aktualisiert": erstgefunden_aktualisiert,
+            "aenderungen": aenderungen,
+        }
         merged = dict(rec)
+        merged["gefunden_am"] = zuerst_gefunden
         merged["_verfuegbar"] = True
         merged["_zuerst_gefunden"] = zuerst_gefunden
+        merged["_wurde_aktualisiert"] = wurde_aktualisiert
+        if aenderungen:
+            merged["aenderungen"] = aenderungen
         all_records.append(merged)
 
     for job_id, entry in previous_jobs.items():
         if job_id in current_ids:
+            continue
+        if not _still_matches_filters(entry.get("record", {}), terms, blacklist):
             continue
         seit_wann_weg = entry.get("seit_wann_nicht_verfuegbar") or entry.get("zuletzt_gesehen") or current_scan_at
         if _days_since(seit_wann_weg, current_scan_at) > UNAVAILABLE_RETENTION_DAYS:
@@ -337,22 +437,39 @@ def _merge_job_store(
             "zuletzt_gesehen": entry.get("zuletzt_gesehen"),
             "seit_wann_nicht_verfuegbar": seit_wann_weg,
             "zuerst_gefunden": entry.get("zuerst_gefunden"),
+            "erstgefunden_aktualisiert": entry.get("erstgefunden_aktualisiert"),
+            "aenderungen": entry.get("aenderungen") or [],
         }
         merged = dict(entry.get("record", {}))
+        merged["gefunden_am"] = entry.get("zuerst_gefunden")
         merged["_verfuegbar"] = False
         merged["_seit_wann_nicht_verfuegbar"] = seit_wann_weg
         merged["_zuerst_gefunden"] = entry.get("zuerst_gefunden")
+        merged["_wurde_aktualisiert"] = False
+        if entry.get("aenderungen"):
+            merged["aenderungen"] = entry.get("aenderungen")
         all_records.append(merged)
 
     return all_records, new_store
 
 
 def _job_id(rec: dict, idx: int) -> str:
-    """Leitet eine stabile Kennung für eine Stelle aus ihrer URL ab (für localStorage-Keys).
+    """Leitet eine stabile Kennung für eine Stelle ab (für localStorage-Keys
+    und den Scan-Vergleich in _merge_job_store).
+
+    Nutzt bevorzugt die Referenznummer (z. B. "REF291834M") statt der
+    URL/uuid: Wenn Bosch eine Stelle aktualisiert, ändert sich manchmal die
+    uuid in der URL, obwohl es dieselbe Stelle (gleiche Referenznummer)
+    bleibt - mit URL-basierter ID würde das fälschlich als neue Stelle
+    gezählt (verlorenes "gefunden_am", kein erkanntes Update). Nur wenn keine
+    Referenznummer vorhanden ist, wird auf die URL zurückgefallen.
 
     Muss in HTML- und Kartenansicht identisch berechnet werden, damit der in
     einer Ansicht gesetzte Status in der anderen Ansicht wiedergefunden wird.
     """
+    referenznummer = (rec.get("referenznummer") or "").strip()
+    if referenznummer:
+        return html.escape(referenznummer)
     return html.escape((rec.get("url") or f"job-{idx}").rsplit("/", 1)[-1] or f"job-{idx}")
 
 
@@ -370,6 +487,69 @@ def _status_options_html(selected: str = "") -> str:
         f'<option value="{value}"{" selected" if value == selected else ""}>{label}</option>'
         for value, label in STATUS_OPTIONS
     )
+
+
+def _stellentext_diff_html(alter_text: str, neuer_text: str) -> str:
+    """Erzeugt eine Wort-Diff-Ansicht (HTML) zwischen altem und neuem
+    Stellentext für das Aufklappmenü "Änderungsverlauf" - gelöschte Wörter
+    durchgestrichen (<del>), neu hinzugekommene Wörter hervorgehoben (<ins>),
+    unveränderter Text bleibt normal."""
+    alte_woerter = alter_text.split()
+    neue_woerter = neuer_text.split()
+    matcher = difflib.SequenceMatcher(a=alte_woerter, b=neue_woerter, autojunk=False)
+    parts = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            parts.append(html.escape(" ".join(neue_woerter[j1:j2])))
+            continue
+        if i1 != i2:
+            parts.append(f'<del class="diff-del">{html.escape(" ".join(alte_woerter[i1:i2]))}</del>')
+        if j1 != j2:
+            parts.append(f'<ins class="diff-ins">{html.escape(" ".join(neue_woerter[j1:j2]))}</ins>')
+    return " ".join(parts)
+
+
+def _change_history_html(aenderungen: list[dict]) -> str:
+    """Baut das Aufklappmenü "Änderungsverlauf" mit Wort-Diff + vollständigem
+    altem/neuem Text/Titel pro Änderung (siehe _merge_job_store.aenderungen)."""
+    if not aenderungen:
+        return ""
+    entries = []
+    # Neueste Änderung zuerst anzeigen.
+    for change in reversed(aenderungen):
+        zeitpunkt = html.escape(_format_scan_timestamp(change.get("zeitpunkt")))
+        alter_titel = change.get("alter_titel") or ""
+        neuer_titel = change.get("neuer_titel") or ""
+        titel_html = ""
+        if alter_titel and neuer_titel:
+            titel_diff_html = _stellentext_diff_html(alter_titel, neuer_titel)
+            titel_html = f"""
+                <div class="diff-view diff-titel"><strong>Titel:</strong> {titel_diff_html}</div>"""
+        alter_text = change.get("alter_text") or ""
+        neuer_text = change.get("neuer_text") or ""
+        text_html = ""
+        if alter_text and neuer_text:
+            diff_html = _stellentext_diff_html(alter_text, neuer_text)
+            alter_text_html = html.escape(alter_text).replace("\n", "<br>")
+            neuer_text_html = html.escape(neuer_text).replace("\n", "<br>")
+            text_html = f"""
+                <div class="diff-view">{diff_html}</div>
+                <details class="change-fulltext">
+                    <summary>Alter Text</summary>
+                    <div class="stellentext">{alter_text_html}</div>
+                </details>
+                <details class="change-fulltext">
+                    <summary>Neuer Text</summary>
+                    <div class="stellentext">{neuer_text_html}</div>
+                </details>"""
+        entries.append(f"""
+            <details class="change-entry">
+                <summary>Geändert am {zeitpunkt}</summary>{titel_html}{text_html}
+            </details>""")
+    return f"""
+            <details class="change-history">
+                <summary>📝 Änderungsverlauf ({len(aenderungen)})</summary>{''.join(entries)}
+            </details>"""
 
 
 # Gemeinsames JavaScript für das Status-Dropdown, in Listen- und Kartenansicht
@@ -393,6 +573,40 @@ function getJobStatus(id) {
 
 function setJobStatus(id, value) {
     localStorage.setItem("status_" + id, value);
+}
+
+// Füllt localStorage beim ersten Laden aus der zuletzt exportierten
+// Status-JSON-Datei auf (siehe _load_status_map) - überschreibt dabei NIE
+// bereits vorhandene localStorage-Werte, damit noch nicht exportierte,
+// frischere Browser-Änderungen nicht verloren gehen.
+function initStatusFromFile(fileStatusMap) {
+    if (!fileStatusMap) return;
+    Object.keys(fileStatusMap).forEach((id) => {
+        const key = "status_" + id;
+        if (localStorage.getItem(key) === null) {
+            localStorage.setItem(key, fileStatusMap[id]);
+        }
+    });
+}
+
+// Exportiert den aktuellen Status aller übergebenen Job-IDs als JSON-Download
+// - diese Datei muss manuell neben die Eingabe-JSON gelegt werden (gleicher
+// Dateiname wie beim Erzeugen vorgeschlagen), damit stellen_verarbeitung.py
+// sie beim nächsten Lauf wieder einliest.
+function downloadStatusJson(ids, filename) {
+    const data = {};
+    ids.forEach((id) => {
+        const value = getJobStatus(id);
+        if (value) data[id] = value;
+    });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
 }
 """
 
@@ -503,6 +717,59 @@ def _collect_ort_options(records: list[dict]) -> list[str]:
     for rec in records:
         cities.update(_extract_ort_cities(rec.get("ort") or ""))
     return sorted(cities, key=str.casefold)
+
+
+# Für die Diagrammansicht (build_chart_page) sollen Stellen nach den in
+# config.txt gepflegten Orten gruppiert werden (statt nach jeder einzelnen
+# Adresse) - z. B. landet eine Sammel-Angabe wie "Rülzheim / ... / Stuttgart"
+# unter "Stuttgart", da dieser Ort in [orte] konfiguriert ist. Läuft das
+# Skript als gebündelte .exe, liegt config.txt neben der .exe.
+def _load_configured_orte(base_path: Path) -> list[str]:
+    if getattr(sys, "frozen", False):
+        script_dir = Path(sys.executable).resolve().parent
+    else:
+        script_dir = Path(__file__).resolve().parent
+    for config_path in (base_path.parent / "config.txt", script_dir / "config.txt"):
+        if not config_path.exists():
+            continue
+        lines = config_path.read_text(encoding="utf-8").splitlines()
+        orte: list[str] = []
+        in_section = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.lower() == "[orte]":
+                in_section = True
+                continue
+            if line.lower() == "[\\orte]":
+                in_section = False
+                continue
+            if not in_section or line.startswith("#"):
+                continue
+            orte.append(line)
+        return orte
+    return []
+
+
+def _grouped_ort_label(cities: list[str], configured_orte: list[str]) -> str:
+    """Ordnet die aus dem "ort"-Feld extrahierten Städte (siehe
+    _extract_ort_cities) einem der in config.txt konfigurierten Orte zu.
+
+    Ist keiner der konfigurierten Orte konfiguriert, wird die erste Stadt
+    unverändert zurückgegeben. Passt keine der Städte zu einem konfigurierten
+    Ort, wird die erste Stadt mit "(außerhalb)" gekennzeichnet, damit solche
+    Fälle in der Diagrammansicht auffallen und geprüft werden können.
+    """
+    if not cities:
+        return "Unbekannt"
+    if not configured_orte:
+        return cities[0]
+    for city in cities:
+        for konfigurierter_ort in configured_orte:
+            if konfigurierter_ort.lower() in city.lower() or city.lower() in konfigurierter_ort.lower():
+                return konfigurierter_ort
+    return f"{cities[0]} (außerhalb)"
 
 
 # Filter für den Bewerbungsstatus (siehe STATUS_OPTIONS) - "any" fasst
@@ -804,7 +1071,10 @@ function wireZeitFilterControls(onChange) {{
 def build_html_page(
     records: list[dict],
     map_filename: str | None = None,
+    chart_filename: str | None = None,
     previous_scan_at: str | None = None,
+    status_map: dict[str, str] | None = None,
+    status_filename: str = "status.json",
 ) -> str:
     """Erzeugt eine übersichtliche, eigenständige HTML-Seite aus den Job-Records.
 
@@ -813,6 +1083,12 @@ def build_html_page(
     bleibt so auch nach erneutem Erzeugen der Seite erhalten (solange dieselbe
     Datei am selben Pfad geöffnet wird). Zusätzlich ein Button zum
     Herunterladen der Stellenanzeige als .txt-Datei.
+
+    `status_map` (siehe _load_status_map) füllt den Status serverseitig
+    vor, falls bereits eine exportierte Status-JSON-Datei vorliegt - damit
+    bleibt der Status auch dann erhalten, wenn der Browser sein localStorage
+    verliert. Der "💾 Status-Übersicht speichern"-Button im Header exportiert
+    den aktuellen Status aller Stellen als `status_filename`.
     """
     generated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
 
@@ -865,6 +1141,13 @@ def build_html_page(
             if not verfuegbar
             else ""
         )
+        # Echte inhaltliche Aktualisierung (Bosch-"aktualisiert"-Datum hat
+        # sich seit dem erstmaligen Fund geändert) separat markieren, siehe
+        # _merge_job_store._wurde_aktualisiert.
+        updated_badge = (
+            '<span class="updated-badge">🔄 Aktualisiert seit Fund</span>' if rec.get("_wurde_aktualisiert") else ""
+        )
+        change_history_html = _change_history_html(rec.get("aenderungen") or [])
 
         body_html = f"""
             <div class="meta">
@@ -889,7 +1172,7 @@ def build_html_page(
             <details>
                 <summary>Stellenbeschreibung anzeigen</summary>
                 <div class="stellentext">{stellentext}</div>
-            </details>"""
+            </details>{change_history_html}"""
 
         if verfuegbar:
             card_inner = body_html
@@ -902,11 +1185,13 @@ def build_html_page(
 
         cards.append(f"""
         <article class="card{'' if verfuegbar else ' unavailable'}" id="card_{job_id}" data-eg-klass="{eg_klass_attr}" data-ort-city="{ort_city_attr}" data-aktualisiert="{aktualisiert_iso}" data-verfuegbar="{'1' if verfuegbar else '0'}">
-            <h2><a href="{url}" target="_blank" rel="noopener">{title}</a>{vergeben_badge}</h2>{card_inner}
+            <h2><a href="{url}" target="_blank" rel="noopener">{title}</a>{vergeben_badge}{updated_badge}</h2>{card_inner}
         </article>""")
 
     cards_html = "\n".join(cards) if cards else '<p class="empty">Keine passenden Stellen gefunden.</p>'
     jobs_data_json = json.dumps(jobs_data, ensure_ascii=False).replace("</", "<\\/")
+    status_map_json = json.dumps(status_map or {}, ensure_ascii=False).replace("</", "<\\/")
+    status_filename_json = json.dumps(status_filename, ensure_ascii=False)
 
     verfuegbar_count = sum(1 for rec in records if rec.get("_verfuegbar", True))
     vergeben_count = len(records) - verfuegbar_count
@@ -957,6 +1242,17 @@ def build_html_page(
     .vergeben-badge {{
         display: inline-block;
         background: #555;
+        color: #fff;
+        border-radius: 10px;
+        padding: 2px 8px;
+        font-size: 0.75rem;
+        font-weight: normal;
+        margin-left: 8px;
+        vertical-align: middle;
+    }}
+    .updated-badge {{
+        display: inline-block;
+        background: #e65100;
         color: #fff;
         border-radius: 10px;
         padding: 2px 8px;
@@ -1024,6 +1320,34 @@ def build_html_page(
         line-height: 1.5;
         color: #333;
     }}
+    .change-history {{ margin-top: 10px; }}
+    .change-history > summary {{ font-weight: 600; }}
+    .change-entry {{
+        margin: 8px 0 8px 16px;
+        padding: 8px 10px;
+        background: #fafafa;
+        border: 1px solid #e0e0e0;
+        border-radius: 6px;
+    }}
+    .change-fulltext {{ margin: 6px 0 6px 12px; }}
+    .change-fulltext summary {{ font-size: 0.85rem; }}
+    .diff-titel {{ margin-bottom: 8px; }}
+    .diff-view {{
+        margin-top: 6px;
+        font-size: 0.9rem;
+        line-height: 1.6;
+        color: #333;
+    }}
+    .diff-del {{
+        background: #fdecea;
+        color: #a13a2a;
+        text-decoration: line-through;
+    }}
+    .diff-ins {{
+        background: #e6f4ea;
+        color: #1e7e34;
+        text-decoration: none;
+    }}
     .empty {{ color: #777; }}
     .eg-tag {{ background: #fdecea; color: #a13a2a; }}
     {_FILTERBAR_CSS}
@@ -1032,7 +1356,8 @@ def build_html_page(
 <body>
 <header>
     <h1>Bosch Stellensuche – Ergebnisse</h1>
-    <p>{verfuegbar_count} passende Stelle(n){f' &middot; {vergeben_count} davon nicht mehr verfügbar' if vergeben_count else ''} &middot; erzeugt am {generated_at}{f' &middot; <a href="{html.escape(map_filename)}">🗺️ Karte anzeigen</a>' if map_filename else ''}</p>
+    <p>{verfuegbar_count} passende Stelle(n){f' &middot; {vergeben_count} davon nicht mehr verfügbar' if vergeben_count else ''} &middot; erzeugt am {generated_at}{f' &middot; <a href="{html.escape(map_filename)}">🗺️ Karte anzeigen</a>' if map_filename else ''}{f' &middot; <a href="{html.escape(chart_filename)}">📊 Diagramm anzeigen</a>' if chart_filename else ''}</p>
+    <p><button type="button" id="save-status-btn">💾 Status-Übersicht als JSON speichern</button> <small>Als „{html.escape(status_filename)}" neben die Eingabe-JSON legen, damit der Status beim nächsten Erzeugen des Berichts wieder eingelesen wird.</small></p>
 </header>
 {_eg_filterbar_html(ort_options)}
 <main>
@@ -1040,6 +1365,8 @@ def build_html_page(
 </main>
 <script>
 const JOBS_DATA = {jobs_data_json};
+const STATUS_FROM_FILE = {status_map_json};
+const STATUS_FILENAME = {status_filename_json};
 {_STATUS_SCRIPT}
 {_eg_filter_script()}
 {_zeit_filter_script(previous_scan_at)}
@@ -1108,6 +1435,7 @@ function applyStatusToCard(select) {{
 }}
 
 document.addEventListener("DOMContentLoaded", () => {{
+    initStatusFromFile(STATUS_FROM_FILE);
     const countLabel = document.getElementById("eg-filter-count");
     const allCards = Array.from(document.querySelectorAll(".card"));
 
@@ -1151,6 +1479,10 @@ document.addEventListener("DOMContentLoaded", () => {{
         btn.addEventListener("click", () => copyText(btn.dataset.id, btn));
     }});
 
+    document.getElementById("save-status-btn").addEventListener("click", () => {{
+        downloadStatusJson(Object.keys(JOBS_DATA), STATUS_FILENAME);
+    }});
+
     wireEgFilterControls(applyFilters);
     wireZeitFilterControls(applyFilters);
 }});
@@ -1188,13 +1520,15 @@ def build_map_page(
     geocode_cache: dict,
     proxy_server: str | None = None,
     previous_scan_at: str | None = None,
+    status_map: dict[str, str] | None = None,
+    status_filename: str = "status.json",
 ) -> str:
     """Erzeugt eine eigenständige HTML-Seite mit einer Karte (Leaflet/OSM),
     auf der jede Stelle als Punkt an ihrem Standort eingeblendet wird.
 
     Jede Stelle im Popup hat dasselbe Status-Dropdown wie die Listenansicht
     (gleicher localStorage-Key "status_<job_id>", da _job_id() identisch
-    berechnet wird).
+    berechnet wird). `status_map`/`status_filename` siehe build_html_page.
 
     Adressen werden über den übergebenen Geocoding-Cache aufgelöst (siehe
     geocode_address). Mehrere Stellen am selben Ort werden zu einem
@@ -1225,12 +1559,15 @@ def build_map_page(
             "ort_city": _extract_ort_cities(ort),
             "aktualisiert": _date_to_iso(rec.get("aktualisiert")),
             "gefunden": _format_scan_timestamp(rec.get("_zuerst_gefunden")),
+            "wurde_aktualisiert": bool(rec.get("_wurde_aktualisiert")),
             "verfuegbar": rec.get("_verfuegbar", True),
             "seit_wann_nicht_verfuegbar": _format_scan_timestamp(rec.get("_seit_wann_nicht_verfuegbar")) if not rec.get("_verfuegbar", True) else "",
         })
 
     markers = list(points.values())
     markers_json = json.dumps(markers, ensure_ascii=False).replace("</", "<\\/")
+    status_map_json = json.dumps(status_map or {}, ensure_ascii=False).replace("</", "<\\/")
+    status_filename_json = json.dumps(status_filename, ensure_ascii=False)
     verfuegbar_count = sum(1 for rec in records if rec.get("_verfuegbar", True))
     vergeben_count = len(records) - verfuegbar_count
     ort_options = _collect_ort_options(records)
@@ -1278,6 +1615,16 @@ def build_map_page(
         margin-left: 6px;
         vertical-align: middle;
     }}
+    .updated-badge {{
+        display: inline-block;
+        background: #e65100;
+        color: #fff;
+        border-radius: 10px;
+        padding: 1px 7px;
+        font-size: 0.72rem;
+        margin-left: 6px;
+        vertical-align: middle;
+    }}
     {_FILTERBAR_CSS}
     .filterbar {{ margin: 12px 24px 0; flex: none; }}
 </style>
@@ -1289,12 +1636,15 @@ def build_map_page(
         {f' &middot; {vergeben_count} davon nicht mehr verfügbar' if vergeben_count else ''}
         {f' &middot; {missing} ohne ermittelbaren Standort' if missing else ''}
         &middot; erzeugt am {generated_at} &middot; <a href="javascript:history.back()">← Zurück zur Liste</a></p>
+    <p><button type="button" id="save-status-btn">💾 Status-Übersicht als JSON speichern</button></p>
 </header>
 {_eg_filterbar_html(ort_options)}
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const MARKERS = {markers_json};
+const STATUS_FROM_FILE = {status_map_json};
+const STATUS_FILENAME = {status_filename_json};
 {_STATUS_SCRIPT}
 {_eg_filter_script()}
 {_zeit_filter_script(previous_scan_at)}
@@ -1304,9 +1654,9 @@ function updateJobStatus(select) {{
 }}
 
 const map = L.map('map').setView([51.1657, 10.4515], 6);
-L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
     maxZoom: 19,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>-Mitwirkende'
+    attribution: '&copy; <a href="https://www.esri.com">Esri</a> &mdash; Source: Esri, HERE, Garmin, OpenStreetMap-Mitwirkende'
 }}).addTo(map);
 
 const STATUS_OPTIONS = {json.dumps(STATUS_OPTIONS, ensure_ascii=False)};
@@ -1327,8 +1677,9 @@ function jobsHtmlFor(jobs) {{
         ).join("");
         const unavailable = j.verfuegbar === false;
         const badge = unavailable ? `<span class="vergeben-badge">🚫 Vergeben${{j.seit_wann_nicht_verfuegbar ? " (seit " + j.seit_wann_nicht_verfuegbar + ")" : ""}}</span>` : "";
+        const updatedBadge = j.wurde_aktualisiert ? `<span class="updated-badge">🔄 Aktualisiert seit Fund</span>` : "";
         const gefundenLine = j.gefunden ? `<br><small>🔎 Gefunden am: ${{j.gefunden}}</small>` : "";
-        return `<li${{unavailable ? ' class="unavailable"' : ""}}><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a>${{badge}}${{gefundenLine}}
+        return `<li${{unavailable ? ' class="unavailable"' : ""}}><a href="${{j.url}}" target="_blank" rel="noopener">${{safeTitle}}</a>${{badge}}${{updatedBadge}}${{gefundenLine}}
             <select data-id="${{j.id}}" onchange="updateJobStatus(this)">${{optionsHtml}}</select>
         </li>`;
     }}).join("");
@@ -1362,9 +1713,150 @@ function renderMarkers() {{
         : "";
 }}
 
+initStatusFromFile(STATUS_FROM_FILE);
 renderMarkers();
 wireEgFilterControls(renderMarkers);
 wireZeitFilterControls(renderMarkers);
+document.getElementById("save-status-btn").addEventListener("click", () => {{
+    const allIds = MARKERS.flatMap((pt) => pt.jobs.map((j) => j.id));
+    downloadStatusJson(allIds, STATUS_FILENAME);
+}});
+</script>
+</body>
+</html>
+"""
+
+
+def build_chart_page(records: list[dict], configured_orte: list[str] | None = None) -> str:
+    """Erzeugt eine eigenständige HTML-Seite mit einem Tortendiagramm der
+    Stellen, gruppiert nach den in config.txt unter [orte] gepflegten Orten
+    (siehe _grouped_ort_label). Orte außerhalb dieser Liste werden mit
+    "(außerhalb)" gekennzeichnet statt einfach mitgezählt.
+
+    Bereits vergebene Stellen (siehe _verfuegbar) werden pro Ort als
+    zusätzliches, helleres Segment derselben Farbe dargestellt statt einfach
+    ausgeblendet, damit das Verhältnis verfügbar/vergeben je Ort sichtbar bleibt.
+
+    Bereits vergebene Stellen (siehe _verfuegbar) werden dafür in einem
+    eigenen, zweiten Tortendiagramm dargestellt statt zusammen mit den
+    verfügbaren Stellen in einem Diagramm (das wurde bei vielen Orten schnell
+    unübersichtlich). Derselbe Ort bekommt in beiden Diagrammen dieselbe
+    Farbe, damit sich verfügbar/vergeben pro Ort trotzdem vergleichen lässt.
+
+    Braucht kein Geocoding, da nur der Ortsname (nicht die Koordinate)
+    benötigt wird - kann daher unabhängig von der Kartenansicht erzeugt werden.
+    """
+    generated_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+    configured_orte = configured_orte or []
+
+    city_counts: dict[str, dict[str, int]] = {}
+    for rec in records:
+        cities = _extract_ort_cities(rec.get("ort") or "")
+        city = _grouped_ort_label(cities, configured_orte)
+        counts = city_counts.setdefault(city, {"verfuegbar": 0, "vergeben": 0})
+        if rec.get("_verfuegbar", True):
+            counts["verfuegbar"] += 1
+        else:
+            counts["vergeben"] += 1
+
+    sorted_cities = sorted(
+        city_counts.items(), key=lambda kv: kv[1]["verfuegbar"] + kv[1]["vergeben"], reverse=True
+    )
+    # Farbe pro Ort ist über beide Diagramme hinweg identisch (Index in
+    # sorted_cities bestimmt den Farbton), damit sich ein Ort in beiden
+    # Diagrammen leicht wiedererkennen lässt.
+    hue_by_city = {
+        city: round((i * 360) / len(sorted_cities)) if sorted_cities else 0
+        for i, (city, _) in enumerate(sorted_cities)
+    }
+
+    def _slices(status_key: str) -> tuple[list[str], list[int], list[str]]:
+        labels, values, colors = [], [], []
+        for city, counts in sorted_cities:
+            count = counts[status_key]
+            if not count:
+                continue
+            labels.append(f"{city} ({count})")
+            values.append(count)
+            colors.append(f"hsl({hue_by_city[city]}, 65%, 50%)")
+        return labels, values, colors
+
+    verfuegbar_labels, verfuegbar_values, verfuegbar_colors = _slices("verfuegbar")
+    vergeben_labels, vergeben_values, vergeben_colors = _slices("vergeben")
+
+    verfuegbar_total = sum(c["verfuegbar"] for c in city_counts.values())
+    vergeben_total = sum(c["vergeben"] for c in city_counts.values())
+
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bosch Stellensuche – Diagramm</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+    :root {{ color-scheme: light dark; }}
+    body {{
+        font-family: "Segoe UI", Arial, sans-serif;
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 24px;
+        background: #f4f5f7;
+        color: #1a1a1a;
+    }}
+    header {{ margin-bottom: 24px; }}
+    header h1 {{ margin-bottom: 4px; }}
+    header p {{ color: #555; margin: 0; }}
+    header a {{ color: #005691; text-decoration: none; }}
+    header a:hover {{ text-decoration: underline; }}
+    .charts {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 24px;
+    }}
+    .chart-wrap {{
+        flex: 1 1 380px;
+        background: #fff;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 24px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }}
+    .chart-wrap h2 {{ margin: 0 0 16px 0; font-size: 1.05rem; }}
+    .empty {{ color: #777; }}
+</style>
+</head>
+<body>
+<header>
+    <h1>Bosch Stellensuche – Diagramm nach Ort</h1>
+    <p>{verfuegbar_total} passende Stelle(n) an {len(city_counts)} Ort(en){f' &middot; {vergeben_total} davon nicht mehr verfügbar' if vergeben_total else ''} &middot; erzeugt am {generated_at} &middot; <a href="javascript:history.back()">← Zurück zur Liste</a></p>
+</header>
+<div class="charts">
+    <div class="chart-wrap">
+        <h2>Verfügbare Stellen</h2>
+        {'<canvas id="chart-verfuegbar"></canvas>' if verfuegbar_values else '<p class="empty">Keine verfügbaren Stellen.</p>'}
+    </div>
+    <div class="chart-wrap">
+        <h2>Vergebene Stellen</h2>
+        {'<canvas id="chart-vergeben"></canvas>' if vergeben_values else '<p class="empty">Keine vergebenen Stellen.</p>'}
+    </div>
+</div>
+<script>
+function renderPie(canvasId, labels, values, colors) {{
+    if (!labels.length) return;
+    new Chart(document.getElementById(canvasId), {{
+        type: "pie",
+        data: {{
+            labels: labels,
+            datasets: [{{ data: values, backgroundColor: colors }}],
+        }},
+        options: {{
+            plugins: {{ legend: {{ position: "right" }} }},
+        }},
+    }});
+}}
+renderPie("chart-verfuegbar", {json.dumps(verfuegbar_labels, ensure_ascii=False)}, {json.dumps(verfuegbar_values)}, {json.dumps(verfuegbar_colors)});
+renderPie("chart-vergeben", {json.dumps(vergeben_labels, ensure_ascii=False)}, {json.dumps(vergeben_values)}, {json.dumps(vergeben_colors)});
 </script>
 </body>
 </html>
@@ -1378,12 +1870,19 @@ def process_records(
     map_output: str | None = None,
     no_map: bool = False,
     proxy_server: str | None = None,
+    terms: list[str] | None = None,
+    blacklist: list[str] | None = None,
 ) -> None:
     """Baut HTML- und Kartenansicht aus `records` und schreibt sie neben `base_path`.
 
     `base_path` ist die (fiktive oder echte) JSON-Datei, aus der die Records
     stammen - Ausgabedateien landen standardmäßig im selben Ordner mit
     abgeleitetem Namen (z. B. bosch_jobs_gefiltert.html / _karte.html).
+
+    `terms`/`blacklist` sind die AKTUELLEN Such-/Ausschlussbegriffe aus
+    config.txt (siehe _merge_job_store/_still_matches_filters) - damit eine
+    Stelle, die nach einer Änderung der Begriffe nicht mehr passt, nicht mehr
+    über den Scan-Status-Abgleich wieder auftaucht.
     """
     out_dir = base_path.parent
     html_output_path = out_dir / html_output if html_output else base_path.with_suffix(".html")
@@ -1392,6 +1891,13 @@ def process_records(
     )
     cache_path = out_dir / "geocode_cache.json"
     scan_state_path = out_dir / f"{base_path.stem}_scan_state.json"
+    status_path = out_dir / f"{base_path.stem}_status.json"
+
+    # Zuvor per "💾 Status-Übersicht speichern"-Button exportierter Bewerbungsstatus
+    # (siehe _load_status_map) - macht den Status unabhängig vom (sonst einzigen)
+    # Browser-localStorage, das z. B. beim Öffnen einer frisch erzeugten Datei
+    # leer ist.
+    status_map = _load_status_map(status_path)
 
     # Zeitpunkt und Job-Store des VORHERIGEN Laufs für diese Eingabedatei -
     # müssen vor dem Überschreiben der Scan-State-Datei ausgelesen werden.
@@ -1403,7 +1909,29 @@ def process_records(
     # verschwunden sind, werden als "vergeben"/nicht mehr verfügbar
     # weitergereicht (ausgegraut + eingeklappt in der Ansicht), statt einfach
     # zu verschwinden - siehe _merge_job_store.
-    all_records, job_store = _merge_job_store(records, scan_state.get("jobs", {}), current_scan_at)
+    all_records, job_store = _merge_job_store(
+        records, scan_state.get("jobs", {}), current_scan_at, terms=terms, blacklist=blacklist
+    )
+
+    # "gefunden_am" (erstmaliger Fund dieser Stelle, siehe _merge_job_store)
+    # zusätzlich in die Eingabe-JSON zurückschreiben, damit das Datum auch
+    # dort sichtbar/erhalten bleibt und nicht nur intern in der
+    # Scan-State-Datei existiert - das von Bosch gelieferte "aktualisiert"
+    # wird bei jedem Scan überschrieben, "gefunden_am" bleibt dagegen stabil.
+    records_with_fund_datum = []
+    for idx, rec in enumerate(records):
+        job_id = _job_id(rec, idx)
+        gefunden_am = job_store.get(job_id, {}).get("zuerst_gefunden")
+        aenderungen = job_store.get(job_id, {}).get("aenderungen")
+        rec_out = dict(rec)
+        if gefunden_am:
+            rec_out["gefunden_am"] = gefunden_am
+        if aenderungen:
+            rec_out["aenderungen"] = aenderungen
+        records_with_fund_datum.append(rec_out)
+    base_path.write_text(
+        json.dumps(records_with_fund_datum, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     map_filename = None
     if not no_map:
@@ -1411,7 +1939,12 @@ def process_records(
         geocode_cache = load_geocode_cache(cache_path)
         try:
             map_html = build_map_page(
-                all_records, geocode_cache, proxy_server=proxy_server, previous_scan_at=previous_scan_at
+                all_records,
+                geocode_cache,
+                proxy_server=proxy_server,
+                previous_scan_at=previous_scan_at,
+                status_map=status_map,
+                status_filename=status_path.name,
             )
         finally:
             save_geocode_cache(geocode_cache, cache_path)
@@ -1419,8 +1952,21 @@ def process_records(
         print(f"Kartenansicht gespeichert in: {map_output_path}")
         map_filename = map_output_path.name
 
+    chart_output_path = out_dir / f"{base_path.stem}_diagramm.html"
+    configured_orte = _load_configured_orte(base_path)
+    chart_output_path.write_text(build_chart_page(all_records, configured_orte), encoding="utf-8")
+    print(f"Diagrammansicht gespeichert in: {chart_output_path}")
+    chart_filename = chart_output_path.name
+
     html_output_path.write_text(
-        build_html_page(all_records, map_filename=map_filename, previous_scan_at=previous_scan_at),
+        build_html_page(
+            all_records,
+            map_filename=map_filename,
+            chart_filename=chart_filename,
+            previous_scan_at=previous_scan_at,
+            status_map=status_map,
+            status_filename=status_path.name,
+        ),
         encoding="utf-8",
     )
     print(f"HTML-Übersicht gespeichert in: {html_output_path}")
@@ -1444,11 +1990,23 @@ def main() -> None:
     records = json.loads(input_path.read_text(encoding="utf-8"))
     print(f"{len(records)} Stellen aus {input_path} geladen.")
 
+    # Lazy-Import, um einen Zirkel-Import mit stellensuche.py (das umgekehrt
+    # stellen_verarbeitung importiert) zu vermeiden - config.txt liegt neben
+    # stellensuche.py (CONFIG_FILE), nicht notwendigerweise neben --input.
+    terms = blacklist = None
+    try:
+        from stellensuche import CONFIG_FILE, load_blacklist, load_search_terms
+        terms = load_search_terms(CONFIG_FILE)
+        blacklist = load_blacklist(CONFIG_FILE)
+    except (ImportError, FileNotFoundError):
+        print("Hinweis: config.txt nicht gefunden - Scan-Status-Abgleich berücksichtigt keine Suchbegriffe.")
+
     proxy_server = None if args.no_map else detect_proxy()
     process_records(
         records, input_path,
         html_output=args.html_output, map_output=args.map_output,
         no_map=args.no_map, proxy_server=proxy_server,
+        terms=terms, blacklist=blacklist,
     )
 
 

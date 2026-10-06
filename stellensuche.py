@@ -153,36 +153,54 @@ def detect_proxy() -> str | None:
     return FALLBACK_PROXY
 
 
-def load_search_terms(config_path: Path) -> list[str]:
-    """Liest die Suchbegriffe aus dem Abschnitt [suchbegriffe] in config.txt."""
+def _read_config_section(config_path: Path, section_name: str) -> list[str]:
+    """Liest alle Zeilen aus dem Abschnitt `[section_name]` einer config.txt.
+
+    Jede Zeile, die nur aus "[...]" besteht, gilt als Abschnitts-Marker: Passt
+    sie (case-insensitive) auf `[section_name]`, startet der gesuchte
+    Abschnitt; jeder ANDERE Klammer-Marker (ob korrektes "[\\section]",
+    versehentlich "[/section]" o. Ä., oder der nächste Abschnitt) beendet ihn.
+    Das macht das Parsen robust gegen Tippfehler bei der schließenden Klammer
+    (z. B. beim manuellen Bearbeiten durch Kolleg:innen) - ohne exakt
+    passenden Marker würde sonst ein Abschnitt den nächsten "verschlucken"
+    und z. B. Ausschlussbegriffe als Suchbegriffe zählen (oder umgekehrt).
+
+    Zeilen, die mit "#" beginnen, sind Kommentare und werden ignoriert.
+    Gibt die Zeilen ohne Duplikate (Reihenfolge erhalten) zurück.
+    """
     if not config_path.exists():
         raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {config_path}")
 
+    target = f"[{section_name}]".lower()
     lines = config_path.read_text(encoding="utf-8").splitlines()
-    terms: list[str] = []
+    entries: list[str] = []
     in_section = False
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
-        if line.lower() == "[suchbegriffe]":
-            in_section = True
+        if line.startswith("[") and line.endswith("]"):
+            in_section = line.lower() == target
             continue
-        if line.lower() == "[\\suchbegriffe]":
-            in_section = False
+        if not in_section:
             continue
-        if in_section:
-            terms.append(line)
+        if line.startswith("#"):
+            continue
+        entries.append(line)
 
-    # Duplikate entfernen, Reihenfolge beibehalten
     seen = set()
-    unique_terms = []
-    for term in terms:
-        key = term.lower()
+    unique_entries = []
+    for entry in entries:
+        key = entry.lower()
         if key not in seen:
             seen.add(key)
-            unique_terms.append(term)
-    return unique_terms
+            unique_entries.append(entry)
+    return unique_entries
+
+
+def load_search_terms(config_path: Path) -> list[str]:
+    """Liest die Suchbegriffe aus dem Abschnitt [suchbegriffe] in config.txt."""
+    return _read_config_section(config_path, "suchbegriffe")
 
 
 def load_blacklist(config_path: Path) -> list[str]:
@@ -191,36 +209,7 @@ def load_blacklist(config_path: Path) -> list[str]:
     Stellen, deren Titel einen dieser Begriffe enthält, werden auch dann
     ausgeschlossen, wenn sie einen Suchbegriff treffen.
     """
-    if not config_path.exists():
-        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {config_path}")
-
-    lines = config_path.read_text(encoding="utf-8").splitlines()
-    terms: list[str] = []
-    in_section = False
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.lower() == "[ausschlussbegriffe]":
-            in_section = True
-            continue
-        if line.lower() == "[\\ausschlussbegriffe]":
-            in_section = False
-            continue
-        if not in_section:
-            continue
-        if line.startswith("#"):
-            continue
-        terms.append(line)
-
-    seen = set()
-    unique_terms = []
-    for term in terms:
-        key = term.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_terms.append(term)
-    return unique_terms
+    return _read_config_section(config_path, "ausschlussbegriffe")
 
 
 def load_locations(config_path: Path) -> list[str]:
@@ -231,36 +220,7 @@ def load_locations(config_path: Path) -> list[str]:
 
     Gibt die Orts-Liste ohne Duplikate zurück.
     """
-    if not config_path.exists():
-        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {config_path}")
-
-    lines = config_path.read_text(encoding="utf-8").splitlines()
-    cities: list[str] = []
-    in_section = False
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.lower() == "[orte]":
-            in_section = True
-            continue
-        if line.lower() == "[\\orte]":
-            in_section = False
-            continue
-        if not in_section:
-            continue
-        if line.startswith("#"):
-            continue
-        cities.append(line)
-
-    seen = set()
-    unique_cities = []
-    for city in cities:
-        key = city.lower()
-        if key not in seen:
-            seen.add(key)
-            unique_cities.append(city)
-    return unique_cities
+    return _read_config_section(config_path, "orte")
 
 
 def location_matches(detail: dict, cities: list[str]) -> bool:
@@ -587,9 +547,16 @@ def main() -> None:
     cities = load_locations(CONFIG_FILE)
     print(f"{len(cities)} Orts-Filter aus config.txt geladen.")
 
+    proxy_server = detect_proxy()
+    if proxy_server:
+        # Muss VOR ensure_chromium_installed() gesetzt sein, da der Chromium-Download
+        # über den gebündelten Node-Treiber von Playwright läuft, der den Proxy nur
+        # aus den Umgebungsvariablen des Prozesses übernimmt (nicht aus dem Skript).
+        os.environ.setdefault("HTTPS_PROXY", proxy_server)
+        os.environ.setdefault("HTTP_PROXY", proxy_server)
+
     ensure_chromium_installed()
 
-    proxy_server = detect_proxy()
     launch_kwargs = {"user_data_dir": str(PROFILE_DIR), "headless": args.headless}
     if proxy_server:
         print(f"Verwende Proxy: {proxy_server}")
@@ -640,6 +607,7 @@ def main() -> None:
         records, output_path,
         html_output=args.html_output, map_output=args.map_output,
         no_map=args.no_map, proxy_server=None if args.no_map else stellen_verarbeitung.detect_proxy(),
+        terms=terms, blacklist=blacklist,
     )
 
 
